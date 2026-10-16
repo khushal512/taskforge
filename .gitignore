@@ -1,0 +1,20 @@
+# Build output
+target/
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# IDE and operating system files
+.idea/
+.vscode/
+*.iml
+.project
+.classpath
+.settings/
+.DS_Store
+Thumbs.db
+
+# Local logs
+*.log
