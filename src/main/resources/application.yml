@@ -2,6 +2,9 @@ server:
   port: ${SERVER_PORT:8080}
 
 spring:
+  jackson:
+    deserialization:
+      fail-on-unknown-properties: true
   datasource:
     url: ${DATABASE_URL:jdbc:postgresql://localhost:5432/taskforge}
     username: ${DATABASE_USERNAME:taskforge}
