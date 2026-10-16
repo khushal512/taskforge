@@ -1,13 +1,14 @@
 # TaskForge
 
-TaskForge is a learning project for building a background job platform in small, tested phases. Phase 1 added a Spring Boot HTTP service and health route. Phase 2 adds pure-Java job lifecycle rules. The app does not process or store jobs yet.
+TaskForge is a learning project for building a background job platform in small, tested phases. Phase 1 added a Spring Boot HTTP service and health route. Phase 2 added pure-Java job lifecycle rules. Phase 3 stores jobs in PostgreSQL. There are no job HTTP endpoints or workers yet.
 
 ## Requirements
 
 - Java 21 JDK
 - Maven 3.9 or newer
+- Docker Desktop with Docker Engine running (for PostgreSQL and integration tests)
 
-Docker is not needed for Phase 1. PostgreSQL and Docker Compose will be introduced when persistence is added.
+PostgreSQL runs through Docker Compose for local development; a Windows PostgreSQL installation is not needed.
 
 ## Run locally
 
@@ -15,6 +16,8 @@ In PowerShell, from the repository root:
 
 ```powershell
 java -version
+$env:DATABASE_PASSWORD = 'choose-a-local-password'
+docker compose up -d --wait
 mvn verify
 mvn spring-boot:run
 ```
@@ -25,9 +28,15 @@ In another terminal:
 Invoke-RestMethod http://localhost:8080/api/v1/health
 ```
 
-The response is `{"status":"UP"}`. This route only confirms that the HTTP application responds; it does not check a database or a worker.
+The response is `{"status":"UP"}`. This route only confirms that the HTTP application responds; it does not check a database or a worker. The database connection and Flyway migration are checked during application startup.
 
-The default port is 8080. To select another port for the current PowerShell session, set `$env:SERVER_PORT = '8081'` before starting the app. `.env.example` documents the variable; Spring Boot does not automatically load a `.env` file. Keep real local `.env` files out of Git.
+The default HTTP port is 8080. To select another port for the current PowerShell session, set `$env:SERVER_PORT = '8081'` before starting the app. `DATABASE_URL` defaults to `jdbc:postgresql://localhost:5432/taskforge` and `DATABASE_USERNAME` defaults to `taskforge`. If you change the Compose database name or host port, adjust `DATABASE_URL` too. The password has no usable default: supply `DATABASE_PASSWORD` in the shell. `.env.example` lists configuration names but contains no credential. Compose can read an ignored `.env` file; Spring Boot reads the shell environment, not that file. Never commit a real `.env` file.
+
+`mvn verify` starts an isolated PostgreSQL Testcontainers instance, so Docker must be running even if the Compose database is stopped. Stop the local database with `docker compose down` when finished. The named volume retains its data; deleting it would remove local jobs.
+
+The PostgreSQL JDBC driver sends the JVM timezone name when connecting. This Windows JDK reports `Asia/Calcutta`, which PostgreSQL 17.11 rejects. Maven configures UTC for test and `spring-boot:run` JVMs. If you run the packaged jar directly, use `java -Duser.timezone=UTC -jar target/taskforge-0.1.0-SNAPSHOT.jar`. This changes only that Java process and does not change Windows settings or how instants are stored.
+
+On some Codex terminals, Java may report `user.home=C:\` even when `USERPROFILE` points to the Windows account. If Maven reports an inaccessible `C:\.m2\repository`, set `$env:MAVEN_OPTS = "-Duser.home=$env:USERPROFILE"` for that terminal session, then rerun Maven. This does not change machine-wide configuration.
 
 ## Current architecture
 
@@ -35,9 +44,9 @@ The default port is 8080. To select another port for the current PowerShell sess
 HTTP client → HealthController → HealthResponse JSON
 ```
 
-`com.taskforge` is the application root. The `domain` package now contains the job lifecycle rules. Future packages will add application services, persistence, workers, and configuration. PostgreSQL will be the source of truth for job state. The first worker will poll the database; Redis will be evaluated only after that design is working and tested.
+`com.taskforge` is the application root. The `domain` package contains pure-Java job lifecycle rules. The `persistence` package maps a domain `Job` to a JPA row. Flyway creates the schema and Hibernate validates it. PostgreSQL is the source of truth for job state. Future packages will add application services and workers; Redis will be evaluated only after a database-backed worker is working and tested.
 
-The current domain model and legal transitions are documented in [ADR 0001](docs/adr/0001-job-domain.md).
+The domain model and legal transitions are documented in [ADR 0001](docs/adr/0001-job-domain.md). The persistence design and limits are documented in [ADR 0002](docs/adr/0002-postgres-persistence.md).
 
 ## Development sequence
 
