@@ -1,6 +1,6 @@
 # TaskForge
 
-TaskForge is a learning project for building a background job platform in small, tested phases. Phase 1 contains a Spring Boot HTTP service and a basic health route. It does not process or store jobs yet.
+TaskForge is a learning project for building a background job platform in small, tested phases. Phase 1 added a Spring Boot HTTP service and health route. Phase 2 adds pure-Java job lifecycle rules. The app does not process or store jobs yet.
 
 ## Requirements
 
@@ -35,7 +35,9 @@ The default port is 8080. To select another port for the current PowerShell sess
 HTTP client → HealthController → HealthResponse JSON
 ```
 
-`com.taskforge` is the application root. Future packages will separate API, application services, domain rules, persistence, workers, and configuration. PostgreSQL will be the source of truth for job state. The first worker will poll the database; Redis will be evaluated only after that design is working and tested.
+`com.taskforge` is the application root. The `domain` package now contains the job lifecycle rules. Future packages will add application services, persistence, workers, and configuration. PostgreSQL will be the source of truth for job state. The first worker will poll the database; Redis will be evaluated only after that design is working and tested.
+
+The current domain model and legal transitions are documented in [ADR 0001](docs/adr/0001-job-domain.md).
 
 ## Development sequence
 
