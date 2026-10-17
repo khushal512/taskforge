@@ -20,7 +20,7 @@ import java.util.UUID;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-@SpringBootTest
+@SpringBootTest(properties = "taskforge.worker.scheduling-enabled=false")
 @Testcontainers
 class JpaJobStoreIntegrationTest {
 
@@ -39,7 +39,7 @@ class JpaJobStoreIntegrationTest {
 
     @Test
     void flywayCreatesSchemaOnce() {
-        assertThat(flyway.info().current().getVersion().getVersion()).isEqualTo("1");
+        assertThat(flyway.info().current().getVersion().getVersion()).isEqualTo("2");
         assertThat(flyway.migrate().migrationsExecuted).isZero();
         assertThat(jdbc.queryForObject("select count(*) from information_schema.tables "
                 + "where table_schema = 'public' and table_name = 'jobs'", Integer.class)).isEqualTo(1);
