@@ -1,7 +1,6 @@
 package com.taskforge.persistence;
 
 import com.taskforge.domain.Job;
-import com.taskforge.domain.JobStatus;
 import org.springframework.stereotype.Repository;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -32,12 +31,12 @@ public class JpaJobStore {
     }
 
     /**
-     * Claims one queued job for a single worker instance. This read and write does not
-     * coordinate competing application instances; multi-worker claiming needs a separate design.
+     * Locks and starts one queued job. The transaction commits before a caller outside
+     * a transaction can execute its handler.
      */
     @Transactional
-    public Optional<Job> startOldestQueuedForSingleWorker(Instant at) {
-        return repository.findFirstByStatusOrderByCreatedAtAscCreatedAtNanoRemainderAscIdAsc(JobStatus.QUEUED)
+    public Optional<Job> claimOldestQueued(Instant at) {
+        return repository.findOldestQueuedForUpdateSkipLocked()
                 .map(mapper::toDomain)
                 .map(job -> job.start(at))
                 .map(job -> repository.save(mapper.toEntity(job)))

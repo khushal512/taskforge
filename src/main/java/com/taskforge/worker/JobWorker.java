@@ -22,7 +22,7 @@ public class JobWorker {
 
     /** Processes at most one job; returns false when the queue is empty. */
     public boolean processOne() {
-        Optional<Job> claimed = store.startOldestQueuedForSingleWorker(clock.instant());
+        Optional<Job> claimed = store.claimOldestQueued(clock.instant());
         if (claimed.isEmpty()) {
             return false;
         }
