@@ -2,6 +2,7 @@ package com.taskforge.persistence;
 
 import com.taskforge.domain.Job;
 import com.taskforge.domain.JobStatus;
+import com.taskforge.persistence.ClaimedJob;
 import com.taskforge.domain.ReportPayload;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -31,8 +32,6 @@ import static org.assertj.core.api.Assertions.assertThat;
 @Testcontainers
 class ConcurrentJobClaimIntegrationTest {
 
-    private static final Instant CLAIM_TIME = Instant.parse("2021-01-01T00:00:00Z");
-
     @Container
     @ServiceConnection
     static PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>("postgres:17.11");
@@ -55,11 +54,11 @@ class ConcurrentJobClaimIntegrationTest {
     void twoClaimersCannotClaimTheSameJob() throws Exception {
         Job queued = saveQueued(0);
 
-        List<Optional<Job>> results = claimTogether();
+        List<Optional<ClaimedJob>> results = claimTogether();
 
         assertThat(results).filteredOn(Optional::isPresent).hasSize(1);
         assertThat(results).filteredOn(Optional::isEmpty).hasSize(1);
-        assertThat(results.stream().flatMap(Optional::stream).map(Job::id)).containsExactly(queued.id());
+        assertThat(results.stream().flatMap(Optional::stream).map(ClaimedJob::id)).containsExactly(queued.id());
         assertClaimedOnce(queued.id());
     }
 
@@ -68,10 +67,10 @@ class ConcurrentJobClaimIntegrationTest {
         Job first = saveQueued(0);
         Job second = saveQueued(1);
 
-        List<Optional<Job>> results = claimTogether();
+        List<Optional<ClaimedJob>> results = claimTogether();
 
         assertThat(results).allMatch(Optional::isPresent);
-        assertThat(results.stream().flatMap(Optional::stream).map(Job::id))
+        assertThat(results.stream().flatMap(Optional::stream).map(ClaimedJob::id))
                 .containsExactlyInAnyOrder(first.id(), second.id());
         assertClaimedOnce(first.id());
         assertClaimedOnce(second.id());
@@ -86,7 +85,7 @@ class ConcurrentJobClaimIntegrationTest {
         ExecutorService threads = Executors.newFixedThreadPool(2);
         try {
             Future<UUID> holder = threads.submit(() -> new TransactionTemplate(transactionManager).execute(status -> {
-                UUID lockedId = store.claimOldestQueued(CLAIM_TIME).orElseThrow().id();
+                UUID lockedId = store.claimNextEligible().orElseThrow().id();
                 locked.countDown();
                 await(release);
                 status.setRollbackOnly();
@@ -94,14 +93,14 @@ class ConcurrentJobClaimIntegrationTest {
             }));
             assertThat(locked.await(10, TimeUnit.SECONDS)).isTrue();
 
-            Future<Optional<Job>> other = threads.submit(() -> store.claimOldestQueued(CLAIM_TIME));
+            Future<Optional<ClaimedJob>> other = threads.submit(store::claimNextEligible);
             // The second claim must finish while the oldest row is still locked.
-            assertThat(other.get(10, TimeUnit.SECONDS)).get().extracting(Job::id).isEqualTo(next.id());
+            assertThat(other.get(10, TimeUnit.SECONDS)).get().extracting(ClaimedJob::id).isEqualTo(next.id());
             release.countDown();
             assertThat(holder.get(10, TimeUnit.SECONDS)).isEqualTo(oldest.id());
 
             assertThat(store.findById(oldest.id()).orElseThrow().status()).isEqualTo(JobStatus.QUEUED);
-            assertThat(store.claimOldestQueued(CLAIM_TIME)).get().extracting(Job::id).isEqualTo(oldest.id());
+            assertThat(store.claimNextEligible()).get().extracting(ClaimedJob::id).isEqualTo(oldest.id());
             assertClaimedOnce(oldest.id());
             assertClaimedOnce(next.id());
         } finally {
@@ -111,13 +110,13 @@ class ConcurrentJobClaimIntegrationTest {
         }
     }
 
-    private List<Optional<Job>> claimTogether() throws Exception {
+    private List<Optional<ClaimedJob>> claimTogether() throws Exception {
         CountDownLatch ready = new CountDownLatch(2);
         CountDownLatch start = new CountDownLatch(1);
         ExecutorService threads = Executors.newFixedThreadPool(2);
         try {
-            Future<Optional<Job>> first = threads.submit(() -> claimAfterGate(ready, start));
-            Future<Optional<Job>> second = threads.submit(() -> claimAfterGate(ready, start));
+            Future<Optional<ClaimedJob>> first = threads.submit(() -> claimAfterGate(ready, start));
+            Future<Optional<ClaimedJob>> second = threads.submit(() -> claimAfterGate(ready, start));
             assertThat(ready.await(10, TimeUnit.SECONDS)).isTrue();
             start.countDown();
             return List.of(first.get(10, TimeUnit.SECONDS), second.get(10, TimeUnit.SECONDS));
@@ -128,15 +127,15 @@ class ConcurrentJobClaimIntegrationTest {
         }
     }
 
-    private Optional<Job> claimAfterGate(CountDownLatch ready, CountDownLatch start) {
+    private Optional<ClaimedJob> claimAfterGate(CountDownLatch ready, CountDownLatch start) {
         ready.countDown();
         await(start);
-        return store.claimOldestQueued(CLAIM_TIME);
+        return store.claimNextEligible();
     }
 
     private Job saveQueued(int secondOffset) {
         Instant createdAt = Instant.parse("2020-01-01T00:00:00Z").plusSeconds(secondOffset);
-        return store.save(Job.create(UUID.randomUUID(), new ReportPayload("Report"), createdAt));
+        return store.createQueued(Job.create(UUID.randomUUID(), new ReportPayload("Report"), createdAt));
     }
 
     private void assertClaimedOnce(UUID id) {

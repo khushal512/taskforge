@@ -116,6 +116,41 @@ class JobTest {
     }
 
     @Test
+    void retryWaitPreservesAttemptCountAndStartsOneNewAttemptWhenDue() {
+        Job running = queuedJob().start(CREATED_AT);
+        Instant due = CREATED_AT.plusSeconds(5);
+        Job waiting = running.scheduleRetry(due, CREATED_AT.plusSeconds(1));
+
+        assertEquals(JobStatus.RETRY_WAIT, waiting.status());
+        assertEquals(1, waiting.attemptCount());
+        assertEquals(due, waiting.nextEligibleAt().orElseThrow());
+        assertThrows(IllegalStateException.class, () -> waiting.start(due.minusNanos(1)));
+        assertEquals(1, waiting.attemptCount());
+        assertEquals(2, waiting.start(due).attemptCount());
+    }
+
+    @Test
+    void thirdStartedAttemptCannotScheduleAFourth() {
+        Job first = queuedJob().start(CREATED_AT);
+        Job second = first.scheduleRetry(CREATED_AT, CREATED_AT).start(CREATED_AT);
+        Job third = second.scheduleRetry(CREATED_AT, CREATED_AT).start(CREATED_AT);
+
+        assertEquals(3, third.attemptCount());
+        assertThrows(IllegalStateException.class, () -> third.scheduleRetry(CREATED_AT, CREATED_AT));
+        assertEquals(JobStatus.RUNNING, third.status());
+    }
+
+    @Test
+    void retryDueTimeMayPrecedeNonDecreasingDomainTimestamp() {
+        Instant futureUpdate = CREATED_AT.plusSeconds(3600);
+        Job waiting = queuedJob().start(futureUpdate).scheduleRetry(CREATED_AT.plusSeconds(5), futureUpdate);
+
+        assertEquals(futureUpdate, waiting.updatedAt());
+        assertEquals(CREATED_AT.plusSeconds(5), waiting.nextEligibleAt().orElseThrow());
+        assertEquals(futureUpdate, waiting.start(futureUpdate).updatedAt());
+    }
+
+    @Test
     void rejectsMissingIdentityPayloadOrTime() {
         assertThrows(NullPointerException.class, () -> Job.create(null, PAYLOAD, CREATED_AT));
         assertThrows(NullPointerException.class, () -> Job.create(ID, null, CREATED_AT));

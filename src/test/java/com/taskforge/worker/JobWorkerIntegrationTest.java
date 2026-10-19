@@ -24,7 +24,6 @@ import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 
-import java.time.Clock;
 import java.time.Instant;
 import java.util.List;
 import java.util.UUID;
@@ -49,6 +48,9 @@ class JobWorkerIntegrationTest {
 
     @Autowired
     private JobWorker worker;
+
+    @Autowired
+    private LeaseHeartbeat heartbeat;
 
     @Autowired
     private JobHandlerRegistry registry;
@@ -128,7 +130,7 @@ class JobWorkerIntegrationTest {
     @Test
     void missingHandlerFailsJobWithoutExecutingArbitraryCode() {
         Job queued = saveQueued(0);
-        JobWorker withoutHandlers = new JobWorker(store, new JobHandlerRegistry(List.of()), Clock.systemUTC());
+        JobWorker withoutHandlers = new JobWorker(store, new JobHandlerRegistry(List.of()), heartbeat);
 
         assertThat(withoutHandlers.processOne()).isTrue();
 
@@ -138,9 +140,32 @@ class JobWorkerIntegrationTest {
         assertThat(probe.calls).isZero();
     }
 
+    @Test
+    void explicitlyRetryableHandlerFailureWaitsThenSucceedsOnNextAttempt() {
+        Job queued = saveQueued(0);
+        probe.retryNext = true;
+
+        assertThat(worker.processOne()).isTrue();
+        Job waiting = store.findById(queued.id()).orElseThrow();
+        assertThat(waiting.status()).isEqualTo(JobStatus.RETRY_WAIT);
+        assertThat(waiting.attemptCount()).isEqualTo(1);
+        assertThat(waiting.failureReason()).isEmpty();
+        assertThat(worker.processOne()).isFalse();
+
+        jdbc.update("update jobs set next_eligible_at = clock_timestamp() - interval '1 hour' where id = ?",
+                queued.id());
+        jdbc.update("update job_attempts set next_eligible_at = (select next_eligible_at from jobs where id = ?) "
+                + "where job_id = ? and attempt_number = 1", queued.id(), queued.id());
+        assertThat(worker.processOne()).isTrue();
+        Job succeeded = store.findById(queued.id()).orElseThrow();
+        assertThat(succeeded.status()).isEqualTo(JobStatus.SUCCEEDED);
+        assertThat(succeeded.attemptCount()).isEqualTo(2);
+        assertThat(probe.calls).isEqualTo(2);
+    }
+
     private Job saveQueued(int secondOffset) {
         Instant createdAt = Instant.parse("2020-01-01T00:00:00Z").plusSeconds(secondOffset);
-        return store.save(Job.create(UUID.randomUUID(), new ReportPayload("Quarterly report"), createdAt));
+        return store.createQueued(Job.create(UUID.randomUUID(), new ReportPayload("Quarterly report"), createdAt));
     }
 
     @TestConfiguration
@@ -158,6 +183,7 @@ class JobWorkerIntegrationTest {
         Integer attemptsSeenDuringHandler;
         boolean transactionActiveDuringHandler;
         boolean failNext;
+        boolean retryNext;
         int calls;
 
         ProbeHandler(JdbcTemplate jdbc) {
@@ -169,6 +195,7 @@ class JobWorkerIntegrationTest {
             attemptsSeenDuringHandler = null;
             transactionActiveDuringHandler = false;
             failNext = false;
+            retryNext = false;
             calls = 0;
         }
 
@@ -188,6 +215,10 @@ class JobWorkerIntegrationTest {
             if (failNext) {
                 failNext = false;
                 throw new IllegalStateException("secret handler detail");
+            }
+            if (retryNext) {
+                retryNext = false;
+                throw new RetryableJobException("secret temporary detail");
             }
             return "Simulated report preview";
         }

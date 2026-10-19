@@ -37,6 +37,18 @@ class JobEntity {
     @Column(name = "attempt_count", nullable = false)
     private int attemptCount;
 
+    @Column(name = "max_attempts", nullable = false)
+    private int maxAttempts;
+
+    @Column(name = "next_eligible_at")
+    private OffsetDateTime nextEligibleAt;
+
+    @Column(name = "next_eligible_at_nano_remainder", nullable = false)
+    private short nextEligibleAtNanoRemainder;
+
+    @Column(name = "lease_expires_at")
+    private OffsetDateTime leaseExpiresAt;
+
     @Column(name = "created_at", nullable = false)
     private OffsetDateTime createdAt;
 
@@ -57,13 +69,19 @@ class JobEntity {
     }
 
     JobEntity(UUID id, JobType jobType, Map<String, Object> payload, JobStatus status,
-              int attemptCount, OffsetDateTime createdAt, short createdAtNanoRemainder,
+              int attemptCount, int maxAttempts, OffsetDateTime nextEligibleAt,
+              short nextEligibleAtNanoRemainder, OffsetDateTime leaseExpiresAt,
+              OffsetDateTime createdAt, short createdAtNanoRemainder,
               OffsetDateTime updatedAt, short updatedAtNanoRemainder, String failureReason) {
         this.id = id;
         this.jobType = jobType;
         this.payload = payload;
         this.status = status;
         this.attemptCount = attemptCount;
+        this.maxAttempts = maxAttempts;
+        this.nextEligibleAt = nextEligibleAt;
+        this.nextEligibleAtNanoRemainder = nextEligibleAtNanoRemainder;
+        this.leaseExpiresAt = leaseExpiresAt;
         this.createdAt = createdAt;
         this.createdAtNanoRemainder = createdAtNanoRemainder;
         this.updatedAt = updatedAt;
@@ -76,9 +94,36 @@ class JobEntity {
     Map<String, Object> payload() { return payload; }
     JobStatus status() { return status; }
     int attemptCount() { return attemptCount; }
+    int maxAttempts() { return maxAttempts; }
+    OffsetDateTime nextEligibleAt() { return nextEligibleAt; }
+    short nextEligibleAtNanoRemainder() { return nextEligibleAtNanoRemainder; }
+    OffsetDateTime leaseExpiresAt() { return leaseExpiresAt; }
     OffsetDateTime createdAt() { return createdAt; }
     short createdAtNanoRemainder() { return createdAtNanoRemainder; }
     OffsetDateTime updatedAt() { return updatedAt; }
     short updatedAtNanoRemainder() { return updatedAtNanoRemainder; }
     String failureReason() { return failureReason; }
+
+    void replaceWith(JobEntity next) {
+        if (!id.equals(next.id)) {
+            throw new IllegalArgumentException("Cannot replace another job");
+        }
+        jobType = next.jobType;
+        payload = next.payload;
+        status = next.status;
+        attemptCount = next.attemptCount;
+        maxAttempts = next.maxAttempts;
+        nextEligibleAt = next.nextEligibleAt;
+        nextEligibleAtNanoRemainder = next.nextEligibleAtNanoRemainder;
+        leaseExpiresAt = next.leaseExpiresAt;
+        createdAt = next.createdAt;
+        createdAtNanoRemainder = next.createdAtNanoRemainder;
+        updatedAt = next.updatedAt;
+        updatedAtNanoRemainder = next.updatedAtNanoRemainder;
+        failureReason = next.failureReason;
+    }
+
+    void renewLease(OffsetDateTime newExpiry) {
+        leaseExpiresAt = newExpiry;
+    }
 }

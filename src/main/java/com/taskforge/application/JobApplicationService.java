@@ -15,10 +15,12 @@ public class JobApplicationService {
 
     private final JpaJobStore store;
     private final Clock clock;
+    private final JobExecutionSettings settings;
 
-    JobApplicationService(JpaJobStore store, Clock clock) {
+    JobApplicationService(JpaJobStore store, Clock clock, JobExecutionSettings settings) {
         this.store = store;
         this.clock = clock;
+        this.settings = settings;
     }
 
     public Job submit(JobType jobType, String reportName) {
@@ -33,8 +35,8 @@ public class JobApplicationService {
             throw new InvalidJobRequestException("reportName must be one line with 1 to 100 characters");
         }
 
-        Job job = Job.create(UUID.randomUUID(), payload, clock.instant());
-        return store.save(job);
+        Job job = Job.create(UUID.randomUUID(), payload, clock.instant(), settings.maxAttempts());
+        return store.createQueued(job);
     }
 
     public Job get(UUID id) {

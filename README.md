@@ -1,6 +1,6 @@
 # TaskForge
 
-TaskForge is a learning project for building a background job platform in small, tested phases. Phase 1 added a Spring Boot HTTP service and health route. Phase 2 added pure-Java job lifecycle rules. Phase 3 added PostgreSQL persistence. Phase 4 added job submission and lookup APIs. Phase 5 added a database-backed worker. Phase 6 makes its queued-job claim safe across competing worker instances.
+TaskForge is a learning project for building a background job platform in small, tested phases. Phase 1 added a Spring Boot HTTP service and health route. Phase 2 added pure-Java job lifecycle rules. Phase 3 added PostgreSQL persistence. Phase 4 added job submission and lookup APIs. Phase 5 added a database-backed worker. Phase 6 made claims safe across competing workers. Phase 7 adds bounded retries, leases, and crash recovery.
 
 ## Requirements
 
@@ -40,17 +40,23 @@ $job.id
 Invoke-RestMethod "http://localhost:8080/api/v1/jobs/$($job.id)"
 ```
 
-`POST /api/v1/jobs` returns `201 Created`, a `Location` header pointing to `/api/v1/jobs/{id}`, and the saved job. `GET /api/v1/jobs/{id}` returns that job with `200 OK`. The response includes its ID, job type, normalized payload, status, attempt count, creation and update times, and an optional failure reason. New jobs have status `QUEUED` and attempt count `0`; the worker may change the status soon after the response. Poll GET to observe it. A completed simulated job has attempt count `1`.
+`POST /api/v1/jobs` returns `201 Created`, a `Location` header pointing to `/api/v1/jobs/{id}`, and the saved job. `GET /api/v1/jobs/{id}` returns that job with `200 OK`. The response includes its ID, job type, normalized payload, status, attempt count, creation and update times, and an optional terminal failure reason. New jobs have status `QUEUED` and attempt count `0`; the worker may change the status soon after the response. Poll GET to observe it. A retrying job can show `RETRY_WAIT`; `attemptCount` is the number of attempts **started**, not the number of retries scheduled.
 
 Only `jobType` and `payload.reportName` are accepted in a submission. The server generates the ID, status, attempt count, and timestamps. The only supported type is `GENERATE_REPORT`; report names must be nonblank, at most 100 characters, and one line. Unknown JSON fields are rejected. Invalid input or a malformed UUID returns `400`; an unknown valid UUID returns `404`. API errors use `code`, `message`, and `fieldErrors` fields without stack traces or database details. There is no list or retry endpoint.
 
 ## Database-backed worker
 
-One scheduled worker cycle selects the oldest available queued job with PostgreSQL `FOR UPDATE SKIP LOCKED`, applies the domain `start()` transition, and commits `RUNNING`. It then runs a registered handler outside a transaction and saves either `SUCCEEDED` or `FAILED` in a second transaction. A competing worker skips a row locked by an uncommitted claim and may take another queued job. The only handler builds a deterministic report **preview in memory**. No report file, download, or external service exists; the preview is not stored. `SUCCEEDED` means that this simulation completed, not that a deliverable report was generated. Handler errors produce a fixed safe failure reason rather than exposing exception text.
+One scheduled worker cycle first checks one expired `RUNNING` job for recovery, then claims an eligible `QUEUED` or `RETRY_WAIT` job with PostgreSQL `FOR UPDATE SKIP LOCKED`. The claim transaction applies `start()`, records the numbered attempt, sets a lease, and commits `RUNNING` before the handler executes. A separate heartbeat thread can renew the lease during a slow handler. Completion and recovery use short, guarded transactions that lock the job and update its exact attempt record together. The handler runs outside database transactions. A competing worker skips a locked row and may take another job.
 
-The worker checks one job per tick. `WORKER_POLL_DELAY_MS` defaults to `1000` milliseconds between completed ticks. Set `WORKER_SCHEDULING_ENABLED=false` to disable automatic polling, for example while inspecting queued jobs locally. These settings affect only the worker; the POST endpoint still saves jobs without executing handlers in the request thread.
+Only an explicitly retryable handler error or an expired lease schedules another attempt. Other handler errors fail permanently with a fixed safe reason. The default maximum is three started attempts. After failed attempt 1, the job waits 5 seconds; after attempt 2, 10 seconds; after attempt 3 it becomes `FAILED`. The delay doubles up to a 5-minute cap. PostgreSQL stores the next eligible time; no thread or transaction waits through backoff. The only production handler builds a deterministic report **preview in memory**. No report file, download, or external service exists; the preview is not stored. `SUCCEEDED` means this simulation completed, not that a deliverable report was generated.
 
-Multiple TaskForge worker instances can claim **different** queued jobs through this PostgreSQL claim path. Skipping a locked older job means processing order is not strictly first-in-first-out. If a process stops after committing `RUNNING`, that job remains `RUNNING`; there is no retry or crash recovery yet. If saving the final status fails, the same limitation applies. This version does not guarantee exactly-once execution or effects. See [ADR 0004](docs/adr/0004-concurrent-claiming.md).
+The worker checks at most one abandoned job and processes at most one eligible job per tick. `WORKER_POLL_DELAY_MS` defaults to `1000` milliseconds between completed ticks. Set `WORKER_SCHEDULING_ENABLED=false` to disable automatic polling, for example while inspecting queued jobs locally. `WORKER_MAX_ATTEMPTS`, `WORKER_RETRY_BASE_DELAY_MS`, `WORKER_RETRY_DELAY_CAP_MS`, `WORKER_LEASE_DURATION_MS`, and `WORKER_HEARTBEAT_INTERVAL_MS` have safe defaults shown in `.env.example`. Invalid limits prevent startup. The maximum is stored per submitted job; changing it later affects only new jobs. The POST endpoint still saves jobs without executing handlers in the request thread.
+
+The built-in fixed-delay scheduler runs one handler at a time per application instance. Its single heartbeat thread therefore serves one scheduled claim at a time. If an instance later runs handlers concurrently, use a bounded heartbeat executor and test that a blocked renewal cannot delay another claim past its lease.
+
+Multiple TaskForge instances can claim different jobs. Skipping a locked older row means processing order is not strictly first-in-first-out. If a worker crashes after claiming, its lease eventually expires and another worker can schedule a retry. An old worker cannot renew or save a result after its lease expires or a newer attempt starts. This fences **PostgreSQL state**, not execution or external effects: an old handler may still run, and a successful handler can be repeated if its final save fails. This version does not guarantee exactly-once execution or effects. The report preview has no external side effect. See [ADR 0005](docs/adr/0005-retries-leases-recovery.md).
+
+**Upgrade from Phase 6:** Stop and confirm all Phase 6 application instances have exited before applying Flyway V3 or starting Phase 7 instances. Phase 6 workers can write terminal state without a lease or attempt-history check; mixed versions cannot safely share this schema. V3 marks any existing `RUNNING` job's lease expired so the new worker can recover it. Historical terminal attempts did not record an actual start time; their backfilled start is explicitly marked synthetic.
 
 The default HTTP port is 8080. To select another port for the current PowerShell session, set `$env:SERVER_PORT = '8081'` before starting the app. `DATABASE_URL` defaults to `jdbc:postgresql://localhost:5432/taskforge` and `DATABASE_USERNAME` defaults to `taskforge`. If you change the Compose database name or host port, adjust `DATABASE_URL` too. The password has no usable default: supply `DATABASE_PASSWORD` in the shell. `.env.example` lists configuration names but contains no credential. Compose can read an ignored `.env` file; Spring Boot reads the shell environment, not that file. Never commit a real `.env` file.
 
@@ -71,7 +77,7 @@ HTTP client → HealthController → HealthResponse JSON
 
 `com.taskforge` is the application root. The `api` package contains HTTP DTOs, controllers, and safe error mapping. The `application` package coordinates use cases and supplies a testable clock. The `domain` package contains pure-Java job lifecycle rules. The `persistence` package maps a domain `Job` to a JPA row. The `worker` package schedules cycles and runs allowlisted handlers. Flyway creates the schema and Hibernate validates it. PostgreSQL is the source of truth for job state. Redis will be evaluated only after the database-backed worker is understood and tested.
 
-The domain model and legal transitions are documented in [ADR 0001](docs/adr/0001-job-domain.md). The persistence design and limits are documented in [ADR 0002](docs/adr/0002-postgres-persistence.md). The first worker design is documented in [ADR 0003](docs/adr/0003-first-worker.md); its concurrent claim is documented in [ADR 0004](docs/adr/0004-concurrent-claiming.md).
+The domain model and legal transitions are documented in [ADR 0001](docs/adr/0001-job-domain.md). The persistence design and limits are documented in [ADR 0002](docs/adr/0002-postgres-persistence.md). The first worker design is documented in [ADR 0003](docs/adr/0003-first-worker.md); its concurrent claim is documented in [ADR 0004](docs/adr/0004-concurrent-claiming.md). [ADR 0005](docs/adr/0005-retries-leases-recovery.md) records the revised Phase 7 retry and ownership rules; earlier ADRs describe the design at their respective phases.
 
 ## Development sequence
 
@@ -81,9 +87,9 @@ The domain model and legal transitions are documented in [ADR 0001](docs/adr/000
 4. Submission and status APIs (Phase 4)
 5. First background worker (Phase 5)
 6. Multiple workers and concurrency control (Phase 6)
-7. Retries and failure handling (planned Phase 7)
+7. Retries, leases, and crash recovery (Phase 7)
 8. Redis integration, if it adds a justified benefit (Phase 8)
-9. Idempotency and crash recovery (Phase 9)
+9. Idempotency and further recovery refinements (planned Phase 9)
 10. Authentication and authorization (Phase 10)
 11. Expanded tests and quality checks (Phase 11)
 12. Logs, health, and metrics (Phase 12)

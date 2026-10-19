@@ -22,7 +22,7 @@ class WorkerScheduler {
         try {
             worker.processOne();
         } catch (RuntimeException exception) {
-            // No payload or exception message is logged. Recovery of a stranded RUNNING job is later work.
+            // No payload or exception message is logged; expired RUNNING jobs are checked on later cycles.
             log.error("Worker cycle failed: {}", exception.getClass().getSimpleName());
         }
     }

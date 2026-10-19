@@ -31,12 +31,13 @@ class JobApplicationServiceTest {
     @BeforeEach
     void setUp() {
         store = mock(JpaJobStore.class);
-        service = new JobApplicationService(store, Clock.fixed(now, ZoneOffset.UTC));
+        service = new JobApplicationService(store, Clock.fixed(now, ZoneOffset.UTC),
+                new JobExecutionSettings(3, 5000, 300000, 30000, 10000));
     }
 
     @Test
     void submitCreatesQueuedJobWithServerManagedFields() {
-        when(store.save(any(Job.class))).thenAnswer(invocation -> invocation.getArgument(0));
+        when(store.createQueued(any(Job.class))).thenAnswer(invocation -> invocation.getArgument(0));
 
         Job job = service.submit(JobType.GENERATE_REPORT, "  Quarterly report  ");
 
@@ -47,7 +48,7 @@ class JobApplicationServiceTest {
         assertThat(job.createdAt()).isEqualTo(now);
         assertThat(job.updatedAt()).isEqualTo(now);
         assertThat(job.failureReason()).isEmpty();
-        verify(store).save(job);
+        verify(store).createQueued(job);
     }
 
     @Test

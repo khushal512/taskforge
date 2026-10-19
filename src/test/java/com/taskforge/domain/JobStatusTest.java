@@ -11,9 +11,11 @@ class JobStatusTest {
     void transitionTableIsExhaustive() {
         for (JobStatus current : JobStatus.values()) {
             for (JobStatus next : JobStatus.values()) {
-                boolean expected = (current == JobStatus.QUEUED && next == JobStatus.RUNNING)
+                boolean expected = ((current == JobStatus.QUEUED || current == JobStatus.RETRY_WAIT)
+                        && next == JobStatus.RUNNING)
                         || (current == JobStatus.RUNNING
-                        && (next == JobStatus.SUCCEEDED || next == JobStatus.FAILED));
+                        && (next == JobStatus.SUCCEEDED || next == JobStatus.FAILED
+                        || next == JobStatus.RETRY_WAIT));
 
                 assertEquals(expected, current.canTransitionTo(next), current + " -> " + next);
             }
