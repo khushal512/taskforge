@@ -44,7 +44,7 @@ class JpaJobStoreIntegrationTest {
 
     @Test
     void flywayCreatesSchemaOnce() {
-        assertThat(flyway.info().current().getVersion().getVersion()).isEqualTo("3");
+        assertThat(flyway.info().current().getVersion().getVersion()).isEqualTo("4");
         assertThat(flyway.migrate().migrationsExecuted).isZero();
         assertThat(jdbc.queryForObject("select count(*) from information_schema.tables "
                 + "where table_schema = 'public' and table_name = 'jobs'", Integer.class)).isEqualTo(1);

@@ -5,6 +5,8 @@ import com.taskforge.domain.JobType;
 import com.taskforge.domain.ReportPayload;
 import com.taskforge.persistence.JpaJobStore;
 import com.taskforge.persistence.JobAttemptView;
+import com.taskforge.persistence.StoredSubmission;
+import com.taskforge.persistence.SubmissionKeyAlreadyExistsException;
 import org.springframework.stereotype.Service;
 
 import java.time.Clock;
@@ -26,6 +28,11 @@ public class JobApplicationService {
     }
 
     public Job submit(JobType jobType, String reportName) {
+        return submitWithOptionalKey(jobType, reportName, null).job();
+    }
+
+    /** Coordinates separate store transactions; this method must not wrap them in one transaction. */
+    public SubmissionResult submitWithOptionalKey(JobType jobType, String reportName, String rawKey) {
         if (Objects.requireNonNull(jobType, "jobType") != JobType.GENERATE_REPORT) {
             throw new InvalidJobRequestException("Unsupported job type");
         }
@@ -37,8 +44,24 @@ public class JobApplicationService {
             throw new InvalidJobRequestException("reportName must be one line with 1 to 100 characters");
         }
 
+        SubmissionIdentity identity = rawKey == null ? null : SubmissionIdentity.from(rawKey, jobType, payload);
         Job job = Job.create(UUID.randomUUID(), payload, clock.instant(), settings.maxAttempts());
-        return store.createQueued(job);
+        if (identity == null) {
+            return new SubmissionResult(store.createQueued(job), false);
+        }
+
+        try {
+            return new SubmissionResult(store.createQueuedWithKey(
+                    job, identity.keyDigest(), identity.requestFingerprint()), false);
+        } catch (SubmissionKeyAlreadyExistsException collision) {
+            // The keyed creation has rolled back through the store proxy before this fresh read.
+            StoredSubmission existing = store.findSubmissionByKey(identity.keyDigest())
+                    .orElseThrow(() -> new IllegalStateException("Committed submission key is missing"));
+            if (!existing.requestFingerprint().equals(identity.requestFingerprint())) {
+                throw new IdempotencyConflictException();
+            }
+            return new SubmissionResult(existing.job(), true);
+        }
     }
 
     public Job get(UUID id) {

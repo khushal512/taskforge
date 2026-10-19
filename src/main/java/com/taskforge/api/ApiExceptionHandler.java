@@ -1,6 +1,7 @@
 package com.taskforge.api;
 
 import com.taskforge.application.InvalidJobRequestException;
+import com.taskforge.application.IdempotencyConflictException;
 import com.taskforge.application.JobNotFoundException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -46,6 +47,12 @@ public class ApiExceptionHandler {
     @ExceptionHandler(InvalidJobRequestException.class)
     ResponseEntity<ApiError> invalidJob(InvalidJobRequestException exception) {
         return error(HttpStatus.BAD_REQUEST, "INVALID_REQUEST", exception.getMessage());
+    }
+
+    @ExceptionHandler(IdempotencyConflictException.class)
+    ResponseEntity<ApiError> idempotencyConflict() {
+        return error(HttpStatus.CONFLICT, "IDEMPOTENCY_CONFLICT",
+                "Idempotency key was used for a different job request");
     }
 
     @ExceptionHandler(JobNotFoundException.class)

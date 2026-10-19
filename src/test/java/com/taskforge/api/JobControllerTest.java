@@ -2,6 +2,8 @@ package com.taskforge.api;
 
 import com.taskforge.application.JobApplicationService;
 import com.taskforge.application.JobNotFoundException;
+import com.taskforge.application.IdempotencyConflictException;
+import com.taskforge.application.SubmissionResult;
 import com.taskforge.domain.Job;
 import com.taskforge.domain.JobType;
 import com.taskforge.domain.ReportPayload;
@@ -36,7 +38,8 @@ class JobControllerTest {
     @Test
     void postReturnsCreatedJobAndLocation() throws Exception {
         Job job = Job.create(UUID.randomUUID(), new ReportPayload("Report"), Instant.parse("2026-10-16T10:15:30Z"));
-        when(service.submit(JobType.GENERATE_REPORT, "Report")).thenReturn(job);
+        when(service.submitWithOptionalKey(JobType.GENERATE_REPORT, "Report", null))
+                .thenReturn(new SubmissionResult(job, false));
 
         mvc.perform(post("/api/v1/jobs").contentType(MediaType.APPLICATION_JSON)
                         .content("{\"jobType\":\"GENERATE_REPORT\",\"payload\":{\"reportName\":\"Report\"}}"))
@@ -45,6 +48,37 @@ class JobControllerTest {
                 .andExpect(jsonPath("$.id").value(job.id().toString()))
                 .andExpect(jsonPath("$.status").value("QUEUED"))
                 .andExpect(jsonPath("$.attemptCount").value(0));
+    }
+
+    @Test
+    void keyedPostUsesCreatedOrReplayStatusAndOriginalLocation() throws Exception {
+        Job job = Job.create(UUID.randomUUID(), new ReportPayload("Report"), Instant.parse("2026-10-16T10:15:30Z"));
+        when(service.submitWithOptionalKey(JobType.GENERATE_REPORT, "Report", "key-1"))
+                .thenReturn(new SubmissionResult(job, false), new SubmissionResult(job, true));
+
+        for (int expectedStatus : new int[] {201, 200}) {
+            mvc.perform(post("/api/v1/jobs").header("Idempotency-Key", "key-1")
+                            .contentType(MediaType.APPLICATION_JSON)
+                            .content("{\"jobType\":\"GENERATE_REPORT\",\"payload\":{\"reportName\":\"Report\"}}"))
+                    .andExpect(status().is(expectedStatus))
+                    .andExpect(header().string("Location", "/api/v1/jobs/" + job.id()))
+                    .andExpect(jsonPath("$.id").value(job.id().toString()))
+                    .andExpect(jsonPath("$.payload.reportName").value("Report"));
+        }
+    }
+
+    @Test
+    void conflictingKeyUsesSafeConflictResponse() throws Exception {
+        when(service.submitWithOptionalKey(JobType.GENERATE_REPORT, "Report", "key-1"))
+                .thenThrow(new IdempotencyConflictException());
+
+        mvc.perform(post("/api/v1/jobs").header("Idempotency-Key", "key-1")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"jobType\":\"GENERATE_REPORT\",\"payload\":{\"reportName\":\"Report\"}}"))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.code").value("IDEMPOTENCY_CONFLICT"))
+                .andExpect(jsonPath("$.message").value("Idempotency key was used for a different job request"))
+                .andExpect(jsonPath("$.fieldErrors").isEmpty());
     }
 
     @Test

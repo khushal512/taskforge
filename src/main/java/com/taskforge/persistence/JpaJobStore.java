@@ -47,6 +47,43 @@ public class JpaJobStore {
         return mapper.toDomain(inserted, List.of());
     }
 
+    /** A duplicate key rolls back the provisional job before the caller resolves the winner. */
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public Job createQueuedWithKey(Job job, String keyDigest, String requestFingerprint) {
+        if (job.status() != JobStatus.QUEUED || job.attemptCount() != 0) {
+            throw new IllegalArgumentException("Only a new queued job can be created");
+        }
+        JobEntity inserted = mapper.toEntity(job, null);
+        entityManager.persist(inserted);
+        entityManager.flush();
+        int created = jdbc.update("""
+                INSERT INTO job_submission_keys (key_digest, request_fingerprint, job_id)
+                VALUES (?, ?, ?) ON CONFLICT (key_digest) DO NOTHING
+                """, keyDigest, requestFingerprint, job.id());
+        if (created == 0) {
+            throw new SubmissionKeyAlreadyExistsException();
+        }
+        return mapper.toDomain(inserted, List.of());
+    }
+
+    /** Reads the key, job, and attempt history from one fresh snapshot. */
+    @Transactional(readOnly = true, isolation = Isolation.REPEATABLE_READ, propagation = Propagation.REQUIRES_NEW)
+    public Optional<StoredSubmission> findSubmissionByKey(String keyDigest) {
+        List<SubmissionKeyRow> keys = jdbc.query("""
+                SELECT request_fingerprint, job_id FROM job_submission_keys WHERE key_digest = ?
+                """, (rs, index) -> new SubmissionKeyRow(rs.getString("request_fingerprint"),
+                (UUID) rs.getObject("job_id")), keyDigest);
+        if (keys.isEmpty()) {
+            return Optional.empty();
+        }
+        SubmissionKeyRow key = keys.getFirst();
+        JobEntity row = repository.findById(key.jobId())
+                .orElseThrow(() -> new IllegalStateException("Submission key references a missing job"));
+        return Optional.of(new StoredSubmission(toDomain(row), key.requestFingerprint()));
+    }
+
+    private record SubmissionKeyRow(String requestFingerprint, UUID jobId) { }
+
     // A separate snapshot keeps the job row and its JDBC-loaded attempt history consistent.
     @Transactional(readOnly = true, isolation = Isolation.REPEATABLE_READ, propagation = Propagation.REQUIRES_NEW)
     public Optional<Job> findById(UUID id) {
