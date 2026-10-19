@@ -141,26 +141,44 @@ class JobWorkerIntegrationTest {
     }
 
     @Test
-    void explicitlyRetryableHandlerFailureWaitsThenSucceedsOnNextAttempt() {
-        Job queued = saveQueued(0);
+    void postedJobHistoryShowsRetryTimingThenSuccessfulSecondAttempt() throws Exception {
+        String body = mvc.perform(post("/api/v1/jobs").contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"jobType\":\"GENERATE_REPORT\",\"payload\":{\"reportName\":\"Report\"}}"))
+                .andExpect(status().isCreated())
+                .andReturn().getResponse().getContentAsString();
+        UUID id = UUID.fromString(json.readTree(body).get("id").asText());
         probe.retryNext = true;
 
         assertThat(worker.processOne()).isTrue();
-        Job waiting = store.findById(queued.id()).orElseThrow();
+        Job waiting = store.findById(id).orElseThrow();
         assertThat(waiting.status()).isEqualTo(JobStatus.RETRY_WAIT);
         assertThat(waiting.attemptCount()).isEqualTo(1);
         assertThat(waiting.failureReason()).isEmpty();
         assertThat(worker.processOne()).isFalse();
 
+        mvc.perform(get("/api/v1/jobs/{id}/attempts", id))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$[0].outcome").value("RETRY_WAIT"))
+                .andExpect(jsonPath("$[0].failureReason").value("Temporary job execution failure"))
+                .andExpect(jsonPath("$[0].nextEligibleAt")
+                        .value(waiting.nextEligibleAt().orElseThrow().toString()));
+
         jdbc.update("update jobs set next_eligible_at = clock_timestamp() - interval '1 hour' where id = ?",
-                queued.id());
+                id);
         jdbc.update("update job_attempts set next_eligible_at = (select next_eligible_at from jobs where id = ?) "
-                + "where job_id = ? and attempt_number = 1", queued.id(), queued.id());
+                + "where job_id = ? and attempt_number = 1", id, id);
         assertThat(worker.processOne()).isTrue();
-        Job succeeded = store.findById(queued.id()).orElseThrow();
+        Job succeeded = store.findById(id).orElseThrow();
         assertThat(succeeded.status()).isEqualTo(JobStatus.SUCCEEDED);
         assertThat(succeeded.attemptCount()).isEqualTo(2);
         assertThat(probe.calls).isEqualTo(2);
+
+        mvc.perform(get("/api/v1/jobs/{id}/attempts", id))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$[0].attemptNumber").value(1))
+                .andExpect(jsonPath("$[0].outcome").value("RETRY_WAIT"))
+                .andExpect(jsonPath("$[1].attemptNumber").value(2))
+                .andExpect(jsonPath("$[1].outcome").value("SUCCEEDED"));
     }
 
     private Job saveQueued(int secondOffset) {

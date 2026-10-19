@@ -4,9 +4,11 @@ import com.taskforge.domain.Job;
 import com.taskforge.domain.JobType;
 import com.taskforge.domain.ReportPayload;
 import com.taskforge.persistence.JpaJobStore;
+import com.taskforge.persistence.JobAttemptView;
 import org.springframework.stereotype.Service;
 
 import java.time.Clock;
+import java.util.List;
 import java.util.Objects;
 import java.util.UUID;
 
@@ -41,6 +43,11 @@ public class JobApplicationService {
 
     public Job get(UUID id) {
         return store.findById(Objects.requireNonNull(id, "id"))
+                .orElseThrow(() -> new JobNotFoundException(id));
+    }
+
+    public List<JobAttemptView> getAttempts(UUID id) {
+        return store.findAttemptHistory(Objects.requireNonNull(id, "id"))
                 .orElseThrow(() -> new JobNotFoundException(id));
     }
 }

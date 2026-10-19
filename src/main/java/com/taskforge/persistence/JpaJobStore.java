@@ -53,6 +53,16 @@ public class JpaJobStore {
         return repository.findById(id).map(this::toDomain);
     }
 
+    /** Reads and validates the job and its attempts from one PostgreSQL snapshot. */
+    @Transactional(readOnly = true, isolation = Isolation.REPEATABLE_READ, propagation = Propagation.REQUIRES_NEW)
+    public Optional<List<JobAttemptView>> findAttemptHistory(UUID id) {
+        return repository.findById(id).map(row -> {
+            List<AttemptRecord> attempts = attemptsFor(row.id());
+            mapper.toDomain(row, attempts);
+            return attempts.stream().map(JobAttemptView::from).toList();
+        });
+    }
+
     /** Commits RUNNING and its attempt before the caller executes a handler. */
     @Transactional
     public Optional<ClaimedJob> claimNextEligible() {

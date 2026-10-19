@@ -44,6 +44,22 @@ Invoke-RestMethod "http://localhost:8080/api/v1/jobs/$($job.id)"
 
 Only `jobType` and `payload.reportName` are accepted in a submission. The server generates the ID, status, attempt count, and timestamps. The only supported type is `GENERATE_REPORT`; report names must be nonblank, at most 100 characters, and one line. Unknown JSON fields are rejected. Invalid input or a malformed UUID returns `400`; an unknown valid UUID returns `404`. API errors use `code`, `message`, and `fieldErrors` fields without stack traces or database details. There is no list or retry endpoint.
 
+### Attempt history
+
+Inspect a job's execution attempts after submitting it:
+
+```powershell
+Invoke-RestMethod "http://localhost:8080/api/v1/jobs/$($job.id)/attempts"
+```
+
+`GET /api/v1/jobs/{id}/attempts` returns a JSON array in `attemptNumber` order. `startedAt` is the recorded or reconstructed start timestamp; `finishedAt` is when that attempt closed, or `null` while it is running. `outcome` describes that attempt: `RUNNING` is open, `RETRY_WAIT` means it ended and a retry was scheduled, and `SUCCEEDED` or `FAILED` records its final result. `failureReason` is a safe display reason for an attempt that failed or scheduled a retry; unfamiliar stored reasons are shown as `Job attempt failed`. `nextEligibleAt` is the time when that attempt's scheduled retry becomes eligible. Inapplicable `finishedAt`, `failureReason`, and `nextEligibleAt` fields are returned as JSON `null`.
+
+The history keeps each attempt's outcome. An earlier attempt can therefore show `RETRY_WAIT` even when a later attempt succeeds. `GET /api/v1/jobs/{id}` reports the separate, current job status, such as `SUCCEEDED`.
+
+`startTimeSource` explains where `startedAt` came from: `RECORDED` means it was saved when the attempt started; `LEGACY_DERIVED` means it was inferred from a pre-Phase-7 `RUNNING` job's last update time; `LEGACY_SYNTHETIC` means a pre-Phase-7 terminal job's creation time was used for reconstruction. The legacy values are not observed start times.
+
+An existing job with no started attempts returns `200 OK` with `[]`. An unknown valid UUID returns the existing safe `404` response; a malformed UUID returns `400`. This endpoint is currently unauthenticated and intended for local development only. Do not expose it publicly until authentication and job ownership checks are implemented.
+
 ## Database-backed worker
 
 One scheduled worker cycle first checks one expired `RUNNING` job for recovery, then claims an eligible `QUEUED` or `RETRY_WAIT` job with PostgreSQL `FOR UPDATE SKIP LOCKED`. The claim transaction applies `start()`, records the numbered attempt, sets a lease, and commits `RUNNING` before the handler executes. A separate heartbeat thread can renew the lease during a slow handler. Completion and recovery use short, guarded transactions that lock the job and update its exact attempt record together. The handler runs outside database transactions. A competing worker skips a locked row and may take another job.
