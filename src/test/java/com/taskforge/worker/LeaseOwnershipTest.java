@@ -5,9 +5,14 @@ import com.taskforge.domain.Job;
 import com.taskforge.domain.JobPayload;
 import com.taskforge.domain.JobType;
 import com.taskforge.domain.ReportPayload;
+import com.taskforge.observability.WorkerMetrics;
 import com.taskforge.persistence.ClaimedJob;
 import com.taskforge.persistence.JpaJobStore;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.springframework.boot.test.system.CapturedOutput;
+import org.springframework.boot.test.system.OutputCaptureExtension;
 
 import java.time.Instant;
 import java.util.List;
@@ -29,25 +34,36 @@ import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+@ExtendWith(OutputCaptureExtension.class)
 class LeaseOwnershipTest {
     private final JobExecutionSettings settings = new JobExecutionSettings(3, 5000, 300000, 30000, 10000);
+    private final SimpleMeterRegistry registry = new SimpleMeterRegistry();
+    private final WorkerMetrics metrics = new WorkerMetrics(registry);
 
     @Test
-    void heartbeatRejectionAndDatabaseErrorBothEndOwnership() {
+    void heartbeatRejectionAndDatabaseErrorBothEndOwnership(CapturedOutput output) {
         JpaJobStore store = mock(JpaJobStore.class);
-        LeaseHeartbeat heartbeat = new LeaseHeartbeat(store, settings);
+        LeaseHeartbeat heartbeat = new LeaseHeartbeat(store, settings, metrics);
         ClaimedJob claim = claim();
         try {
             LeaseHeartbeat.Ownership lost = new LeaseHeartbeat.Ownership();
             when(store.renewLease(claim.id(), claim.attemptNumber())).thenReturn(false);
             heartbeat.renewOnce(claim, lost);
             assertThat(lost.state()).isEqualTo(LeaseHeartbeat.State.LOST);
-
+            heartbeat.renewOnce(claim, lost);
+            assertThat(registry.counter("taskforge.worker.ownership.losses").count()).isEqualTo(1);
             LeaseHeartbeat.Ownership unknown = new LeaseHeartbeat.Ownership();
             when(store.renewLease(claim.id(), claim.attemptNumber()))
                     .thenThrow(new IllegalStateException("database detail"));
             heartbeat.renewOnce(claim, unknown);
             assertThat(unknown.state()).isEqualTo(LeaseHeartbeat.State.UNKNOWN);
+            assertThat(registry.counter("taskforge.worker.ownership.losses").count()).isEqualTo(1);
+            List<String> events = output.getAll().lines().filter(line -> line.contains("event="))
+                    .map(line -> line.substring(line.indexOf("event="))).toList();
+            assertThat(events).containsExactly(
+                    "event=ownership_lost attempt=1",
+                    "event=lease_renewal_error attempt=1 exception_type=IllegalStateException");
+            assertThat(events).allSatisfy(line -> assertThat(line).doesNotContain("database detail"));
         } finally {
             heartbeat.shutdown();
         }
@@ -93,7 +109,7 @@ class LeaseOwnershipTest {
     @Test
     void closingDuringInFlightRenewalCannotRestoreActiveOwnership() throws Exception {
         JpaJobStore store = mock(JpaJobStore.class);
-        LeaseHeartbeat heartbeat = new LeaseHeartbeat(store, settings);
+        LeaseHeartbeat heartbeat = new LeaseHeartbeat(store, settings, metrics);
         ClaimedJob claim = claim();
         LeaseHeartbeat.Ownership ownership = new LeaseHeartbeat.Ownership();
         CountDownLatch renewalEntered = new CountDownLatch(1);
@@ -138,7 +154,7 @@ class LeaseOwnershipTest {
             }
         };
 
-        JobWorker worker = new JobWorker(store, new JobHandlerRegistry(List.of(handler)), heartbeat);
+        JobWorker worker = new JobWorker(store, new JobHandlerRegistry(List.of(handler)), heartbeat, metrics);
         assertThat(worker.processOne()).isTrue();
         verify(store, never()).completeSuccess(any(), any());
         verify(store, never()).completeFailure(any(), anyBoolean(), any());
@@ -160,7 +176,7 @@ class LeaseOwnershipTest {
             }
         };
 
-        JobWorker worker = new JobWorker(store, new JobHandlerRegistry(List.of(handler)), heartbeat);
+        JobWorker worker = new JobWorker(store, new JobHandlerRegistry(List.of(handler)), heartbeat, metrics);
         assertThat(worker.processOne()).isTrue();
         verify(store, never()).completeSuccess(any(), any());
         verify(store, never()).completeFailure(any(), anyBoolean(), any());
@@ -182,7 +198,7 @@ class LeaseOwnershipTest {
             }
         };
 
-        JobWorker worker = new JobWorker(store, new JobHandlerRegistry(List.of(handler)), heartbeat);
+        JobWorker worker = new JobWorker(store, new JobHandlerRegistry(List.of(handler)), heartbeat, metrics);
         assertThat(worker.processOne()).isTrue();
         verify(store, never()).completeSuccess(any(), any());
         verify(store, never()).completeFailure(any(), anyBoolean(), any());

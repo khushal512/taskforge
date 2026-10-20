@@ -4,12 +4,17 @@ import com.taskforge.application.JobExecutionSettings;
 import com.taskforge.domain.Job;
 import com.taskforge.domain.JobStatus;
 import com.taskforge.domain.ReportPreview;
+import com.taskforge.observability.WorkerMetrics;
 import jakarta.persistence.EntityManager;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Repository;
 import org.springframework.transaction.annotation.Isolation;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.sql.ResultSet;
 import java.sql.SQLException;
@@ -22,19 +27,23 @@ import java.util.UUID;
 
 @Repository
 public class JpaJobStore {
+    private static final Logger log = LoggerFactory.getLogger(JpaJobStore.class);
+
     private final SpringDataJobRepository repository;
     private final JobMapper mapper;
     private final JdbcTemplate jdbc;
     private final JobExecutionSettings settings;
     private final EntityManager entityManager;
+    private final WorkerMetrics metrics;
 
     JpaJobStore(SpringDataJobRepository repository, JobMapper mapper, JdbcTemplate jdbc,
-                JobExecutionSettings settings, EntityManager entityManager) {
+                JobExecutionSettings settings, EntityManager entityManager, WorkerMetrics metrics) {
         this.repository = repository;
         this.mapper = mapper;
         this.jdbc = jdbc;
         this.settings = settings;
         this.entityManager = entityManager;
+        this.metrics = metrics;
     }
 
     /** Creation is the sole unrestricted write; existing jobs use guarded lifecycle methods. */
@@ -134,6 +143,10 @@ public class JpaJobStore {
         row.replaceWith(mapper.toEntity(running, dbNow.plus(settings.leaseDuration())));
         insertAttempt(running);
         repository.flush();
+        recordAfterCommit(() -> {
+            log.info("event=job_claimed attempt={}", running.attemptCount());
+            metrics.claimCommitted();
+        });
         return Optional.of(new ClaimedJob(running.id(), running.attemptCount(), running));
     }
 
@@ -172,6 +185,11 @@ public class JpaJobStore {
         closeAttempt(running.id(), running.attemptCount(), next, reason);
         row.replaceWith(mapper.toEntity(next, null));
         repository.flush();
+        recordAfterCommit(() -> {
+            log.info("event=lease_recovered attempt={} outcome={}", running.attemptCount(), next.status());
+            metrics.recoveryCommitted();
+            metrics.completionCommitted(next.status());
+        });
         return true;
     }
 
@@ -193,6 +211,10 @@ public class JpaJobStore {
                 claim.id(), claim.attemptNumber(), preview.text());
         row.replaceWith(mapper.toEntity(succeeded, null));
         repository.flush();
+        recordAfterCommit(() -> {
+            log.info("event=job_completed attempt={} outcome=SUCCEEDED", claim.attemptNumber());
+            metrics.completionCommitted(JobStatus.SUCCEEDED);
+        });
         return true;
     }
 
@@ -212,7 +234,26 @@ public class JpaJobStore {
         closeAttempt(claim.id(), claim.attemptNumber(), next, normalizedReason);
         row.replaceWith(mapper.toEntity(next, null));
         repository.flush();
+        recordAfterCommit(() -> {
+            log.info("event=job_completed attempt={} outcome={}", claim.attemptNumber(), next.status());
+            metrics.completionCommitted(next.status());
+        });
         return true;
+    }
+
+    private static void recordAfterCommit(Runnable observation) {
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCommit() {
+                try {
+                    observation.run();
+                } catch (RuntimeException exception) {
+                    // Telemetry must not turn an already committed lifecycle change into a reported failure.
+                    log.warn("event=worker_observation_error exception_type={}",
+                            exception.getClass().getSimpleName());
+                }
+            }
+        });
     }
 
     private Job failureTransition(Job running, boolean retryable, String reason, Instant dbNow) {

@@ -3,6 +3,7 @@ package com.taskforge.worker;
 import com.taskforge.application.JobExecutionSettings;
 import com.taskforge.persistence.ClaimedJob;
 import com.taskforge.persistence.JpaJobStore;
+import com.taskforge.observability.WorkerMetrics;
 import jakarta.annotation.PreDestroy;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -20,15 +21,17 @@ class LeaseHeartbeat {
 
     private final JpaJobStore store;
     private final JobExecutionSettings settings;
+    private final WorkerMetrics metrics;
     private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(task -> {
         Thread thread = new Thread(task, "taskforge-lease-heartbeat");
         thread.setDaemon(true);
         return thread;
     });
 
-    LeaseHeartbeat(JpaJobStore store, JobExecutionSettings settings) {
+    LeaseHeartbeat(JpaJobStore store, JobExecutionSettings settings, WorkerMetrics metrics) {
         this.store = store;
         this.settings = settings;
+        this.metrics = metrics;
     }
 
     Ownership start(ClaimedJob claim) {
@@ -44,13 +47,22 @@ class LeaseHeartbeat {
         if (!ownership.active()) {
             return;
         }
+        boolean renewed;
         try {
-            if (!store.renewLease(claim.id(), claim.attemptNumber())) {
-                ownership.lose(State.LOST);
-            }
+            renewed = store.renewLease(claim.id(), claim.attemptNumber());
         } catch (RuntimeException exception) {
             ownership.lose(State.UNKNOWN);
-            log.error("Lease renewal failed: {}", exception.getClass().getSimpleName());
+            log.error("event=lease_renewal_error attempt={} exception_type={}",
+                    claim.attemptNumber(), exception.getClass().getSimpleName());
+            return;
+        }
+        if (!renewed && ownership.lose(State.LOST)) {
+            log.warn("event=ownership_lost attempt={}", claim.attemptNumber());
+            try {
+                metrics.ownershipLost();
+            } catch (RuntimeException exception) {
+                log.warn("event=worker_observation_error exception_type={}", exception.getClass().getSimpleName());
+            }
         }
     }
 
@@ -75,7 +87,7 @@ class LeaseHeartbeat {
             }
         }
 
-        void lose(State next) {
+        boolean lose(State next) {
             if (next != State.LOST && next != State.UNKNOWN) {
                 throw new IllegalArgumentException("Ownership can only be lost or become unknown");
             }
@@ -84,7 +96,9 @@ class LeaseHeartbeat {
                 if (scheduled != null) {
                     scheduled.cancel(false);
                 }
+                return true;
             }
+            return false;
         }
 
         @Override

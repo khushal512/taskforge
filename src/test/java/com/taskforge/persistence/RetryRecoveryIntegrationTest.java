@@ -3,8 +3,12 @@ package com.taskforge.persistence;
 import com.taskforge.domain.Job;
 import com.taskforge.domain.JobStatus;
 import com.taskforge.domain.ReportPayload;
+import io.micrometer.core.instrument.MeterRegistry;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.springframework.boot.test.system.CapturedOutput;
+import org.springframework.boot.test.system.OutputCaptureExtension;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
@@ -28,6 +32,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 @SpringBootTest(properties = "taskforge.worker.scheduling-enabled=false")
 @Testcontainers
+@ExtendWith(OutputCaptureExtension.class)
 class RetryRecoveryIntegrationTest {
     @Container
     @ServiceConnection
@@ -36,6 +41,7 @@ class RetryRecoveryIntegrationTest {
     @Autowired JpaJobStore store;
     @Autowired JdbcTemplate jdbc;
     @Autowired PlatformTransactionManager transactions;
+    @Autowired MeterRegistry meters;
 
     @BeforeEach
     void clear() {
@@ -71,15 +77,20 @@ class RetryRecoveryIntegrationTest {
     }
 
     @Test
-    void expiredAttemptCannotHeartbeatOrCompleteAfterRecoveryAndNewClaim() {
+    void expiredAttemptCannotHeartbeatOrCompleteAfterRecoveryAndNewClaim(CapturedOutput output) {
         Job queued = queued(Instant.parse("2020-01-01T00:00:00Z"));
         ClaimedJob first = store.claimNextEligible().orElseThrow();
         expireLease(queued.id());
+        double recoveryBefore = count("taskforge.worker.recoveries");
 
         assertThat(store.renewLease(first.id(), first.attemptNumber())).isFalse();
         assertThat(store.completeSuccess(first, new com.taskforge.domain.ReportPreview("Simulated report preview"))).isFalse();
         assertThat(store.recoverOneExpired()).isTrue();
+        assertThat(output.getAll()).contains("event=lease_recovered attempt=1 outcome=RETRY_WAIT")
+                .doesNotContain("event=job_completed attempt=1 outcome=RETRY_WAIT");
+        assertThat(count("taskforge.worker.recoveries")).isEqualTo(recoveryBefore + 1);
         assertThat(store.recoverOneExpired()).isFalse();
+        assertThat(count("taskforge.worker.recoveries")).isEqualTo(recoveryBefore + 1);
         assertThat(store.findById(queued.id()).orElseThrow().status()).isEqualTo(JobStatus.RETRY_WAIT);
 
         makeRetryDue(queued.id(), 1);
@@ -107,6 +118,23 @@ class RetryRecoveryIntegrationTest {
         makeRetryDue(queued.id(), 1);
         ClaimedJob retry = store.claimNextEligible().orElseThrow();
         assertThat(retry.job().updatedAt()).isEqualTo(future);
+    }
+
+    @Test
+    void rolledBackClaimDoesNotCountAsCommitted() {
+        Job queued = queued(Instant.parse("2020-01-01T00:00:00Z"));
+        double before = count("taskforge.worker.claims");
+
+        new TransactionTemplate(transactions).execute(status -> {
+            assertThat(store.claimNextEligible()).isPresent();
+            status.setRollbackOnly();
+            return null;
+        });
+
+        assertThat(count("taskforge.worker.claims")).isEqualTo(before);
+        assertThat(store.findById(queued.id()).orElseThrow().status()).isEqualTo(JobStatus.QUEUED);
+        assertThat(jdbc.queryForObject("select count(*) from job_attempts where job_id = ?", Integer.class,
+                queued.id())).isZero();
     }
 
     @Test
@@ -195,6 +223,10 @@ class RetryRecoveryIntegrationTest {
 
     private Job queued(Instant createdAt) {
         return store.createQueued(Job.create(UUID.randomUUID(), new ReportPayload("Report"), createdAt));
+    }
+
+    private double count(String name) {
+        return meters.get(name).counter().count();
     }
 
     private void expireLease(UUID id) {

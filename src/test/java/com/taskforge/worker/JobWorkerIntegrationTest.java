@@ -6,12 +6,16 @@ import com.taskforge.domain.JobPayload;
 import com.taskforge.domain.JobStatus;
 import com.taskforge.domain.JobType;
 import com.taskforge.domain.ReportPayload;
+import com.taskforge.observability.WorkerMetrics;
 import com.taskforge.persistence.JpaJobStore;
+import io.micrometer.core.instrument.MeterRegistry;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.context.TestConfiguration;
+import org.springframework.boot.test.system.CapturedOutput;
+import org.springframework.boot.test.system.OutputCaptureExtension;
 import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.context.annotation.Bean;
@@ -23,6 +27,7 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
 import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
+import org.junit.jupiter.api.extension.ExtendWith;
 
 import java.time.Instant;
 import java.util.List;
@@ -37,6 +42,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 @SpringBootTest(properties = "taskforge.worker.scheduling-enabled=false")
 @AutoConfigureMockMvc
 @Testcontainers
+@ExtendWith(OutputCaptureExtension.class)
 class JobWorkerIntegrationTest {
 
     @Container
@@ -48,6 +54,12 @@ class JobWorkerIntegrationTest {
 
     @Autowired
     private JobWorker worker;
+
+    @Autowired
+    private WorkerMetrics metrics;
+
+    @Autowired
+    private MeterRegistry meterRegistry;
 
     @Autowired
     private LeaseHeartbeat heartbeat;
@@ -74,10 +86,18 @@ class JobWorkerIntegrationTest {
     }
 
     @Test
-    void commitsRunningBeforeHandlerAndPersistsSuccess() {
+    void commitsRunningBeforeHandlerAndPersistsSuccess(CapturedOutput output) {
         Job queued = saveQueued(0);
+        double claimsBefore = count("taskforge.worker.claims");
+        double successBefore = count("taskforge.worker.completions", "outcome", "SUCCEEDED");
+        long timedBefore = meterRegistry.get("taskforge.worker.handler.duration").timer().count();
 
         assertThat(worker.processOne()).isTrue();
+        assertThat(count("taskforge.worker.claims")).isEqualTo(claimsBefore + 1);
+        assertThat(count("taskforge.worker.completions", "outcome", "SUCCEEDED"))
+                .isEqualTo(successBefore + 1);
+        assertThat(meterRegistry.get("taskforge.worker.handler.duration").timer().count())
+                .isEqualTo(timedBefore + 1);
 
         assertThat(probe.statusSeenDuringHandler).isEqualTo("RUNNING");
         assertThat(probe.attemptsSeenDuringHandler).isEqualTo(1);
@@ -93,6 +113,8 @@ class JobWorkerIntegrationTest {
         assertThat(jdbc.queryForObject("select attempt_number from job_results where job_id = ?", Integer.class,
                 queued.id())).isEqualTo(1);
         assertThat(worker.processOne()).isFalse();
+        assertThat(eventLines(output)).containsExactlyInAnyOrder(
+                "event=job_claimed attempt=1", "event=job_completed attempt=1 outcome=SUCCEEDED");
     }
 
     @Test
@@ -140,12 +162,15 @@ class JobWorkerIntegrationTest {
     }
 
     @Test
-    void handlerFailureIsPersistedAndNextCycleStillProcessesAnotherJob() {
+    void handlerFailureIsPersistedAndNextCycleStillProcessesAnotherJob(CapturedOutput output) {
         Job first = saveQueued(0);
         Job second = saveQueued(1);
         probe.failNext = true;
+        double failedBefore = count("taskforge.worker.completions", "outcome", "FAILED");
 
         assertThat(worker.processOne()).isTrue();
+        assertThat(count("taskforge.worker.completions", "outcome", "FAILED"))
+                .isEqualTo(failedBefore + 1);
         Job failed = store.findById(first.id()).orElseThrow();
         assertThat(failed.status()).isEqualTo(JobStatus.FAILED);
         assertThat(failed.attemptCount()).isEqualTo(1);
@@ -155,12 +180,18 @@ class JobWorkerIntegrationTest {
         assertThat(worker.processOne()).isTrue();
         assertThat(store.findById(second.id()).orElseThrow().status()).isEqualTo(JobStatus.SUCCEEDED);
         assertThat(probe.calls).isEqualTo(2);
+        assertThat(eventLines(output)).anySatisfy(line -> assertThat(line)
+                .contains("event=handler_failed attempt=1 failure_kind=PERMANENT exception_type=IllegalStateException"));
+        assertThat(eventLines(output)).anySatisfy(line -> assertThat(line)
+                .contains("event=job_completed attempt=1 outcome=FAILED"));
+        assertThat(eventLines(output)).allSatisfy(line -> assertThat(line)
+                .doesNotContain("secret handler detail", "Quarterly report", "Simulated report preview"));
     }
 
     @Test
     void missingHandlerFailsJobWithoutExecutingArbitraryCode() {
         Job queued = saveQueued(0);
-        JobWorker withoutHandlers = new JobWorker(store, new JobHandlerRegistry(List.of()), heartbeat);
+        JobWorker withoutHandlers = new JobWorker(store, new JobHandlerRegistry(List.of()), heartbeat, metrics);
 
         assertThat(withoutHandlers.processOne()).isTrue();
 
@@ -178,8 +209,11 @@ class JobWorkerIntegrationTest {
                 .andReturn().getResponse().getContentAsString();
         UUID id = UUID.fromString(json.readTree(body).get("id").asText());
         probe.retryNext = true;
+        double retryBefore = count("taskforge.worker.completions", "outcome", "RETRY_WAIT");
 
         assertThat(worker.processOne()).isTrue();
+        assertThat(count("taskforge.worker.completions", "outcome", "RETRY_WAIT"))
+                .isEqualTo(retryBefore + 1);
         Job waiting = store.findById(id).orElseThrow();
         assertThat(waiting.status()).isEqualTo(JobStatus.RETRY_WAIT);
         assertThat(waiting.attemptCount()).isEqualTo(1);
@@ -214,6 +248,15 @@ class JobWorkerIntegrationTest {
     private Job saveQueued(int secondOffset) {
         Instant createdAt = Instant.parse("2020-01-01T00:00:00Z").plusSeconds(secondOffset);
         return store.createQueued(Job.create(UUID.randomUUID(), new ReportPayload("Quarterly report"), createdAt));
+    }
+
+    private double count(String name, String... tags) {
+        return meterRegistry.get(name).tags(tags).counter().count();
+    }
+
+    private static List<String> eventLines(CapturedOutput output) {
+        return output.getAll().lines().filter(line -> line.contains("event="))
+                .map(line -> line.substring(line.indexOf("event="))).toList();
     }
 
     @TestConfiguration

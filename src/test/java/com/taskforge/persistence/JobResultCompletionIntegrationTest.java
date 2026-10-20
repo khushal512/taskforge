@@ -4,8 +4,12 @@ import com.taskforge.domain.Job;
 import com.taskforge.domain.JobStatus;
 import com.taskforge.domain.ReportPayload;
 import com.taskforge.domain.ReportPreview;
+import io.micrometer.core.instrument.MeterRegistry;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.springframework.boot.test.system.CapturedOutput;
+import org.springframework.boot.test.system.OutputCaptureExtension;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
@@ -23,6 +27,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 @SpringBootTest(properties = "taskforge.worker.scheduling-enabled=false")
 @Testcontainers
+@ExtendWith(OutputCaptureExtension.class)
 class JobResultCompletionIntegrationTest {
     @Container
     @ServiceConnection
@@ -30,6 +35,7 @@ class JobResultCompletionIntegrationTest {
 
     @Autowired JpaJobStore store;
     @Autowired JdbcTemplate jdbc;
+    @Autowired MeterRegistry meters;
 
     @BeforeEach
     void clear() {
@@ -53,14 +59,17 @@ class JobResultCompletionIntegrationTest {
     }
 
     @Test
-    void expiredAndSupersededClaimsCannotInsertOrReplacePreview() {
+    void expiredAndSupersededClaimsCannotInsertOrReplacePreview(CapturedOutput output) {
         Job queued = queued();
         ClaimedJob first = store.claimNextEligible().orElseThrow();
+        double before = successCount();
         jdbc.update("update jobs set lease_expires_at = clock_timestamp() - interval '1 hour' where id = ?",
                 queued.id());
 
         assertThat(store.completeSuccess(first, new ReportPreview("stale preview"))).isFalse();
+        assertThat(successCount()).isEqualTo(before);
         assertThat(resultCount(queued.id())).isZero();
+        assertThat(output.getAll()).doesNotContain("event=job_completed attempt=1 outcome=SUCCEEDED");
         assertThat(store.recoverOneExpired()).isTrue();
         jdbc.update("update jobs set next_eligible_at = clock_timestamp() - interval '1 hour' where id = ?",
                 queued.id());
@@ -70,10 +79,16 @@ class JobResultCompletionIntegrationTest {
         ClaimedJob second = store.claimNextEligible().orElseThrow();
         assertThat(second.attemptNumber()).isEqualTo(2);
         assertThat(store.completeSuccess(first, new ReportPreview("late preview"))).isFalse();
+        assertThat(successCount()).isEqualTo(before);
         assertThat(resultCount(queued.id())).isZero();
+        assertThat(output.getAll()).doesNotContain("event=job_completed attempt=1 outcome=SUCCEEDED");
 
         assertThat(store.completeSuccess(second, new ReportPreview("current preview"))).isTrue();
+        assertThat(successCount()).isEqualTo(before + 1);
+        assertThat(output.getAll()).contains("event=job_completed attempt=2 outcome=SUCCEEDED")
+                .doesNotContain("event=job_completed attempt=1 outcome=SUCCEEDED");
         assertThat(store.completeSuccess(first, new ReportPreview("replacement"))).isFalse();
+        assertThat(successCount()).isEqualTo(before + 1);
         assertThat(jdbc.queryForObject("select preview from job_results where job_id = ?", String.class,
                 queued.id())).isEqualTo("current preview");
         assertThat(jdbc.queryForObject("select attempt_number from job_results where job_id = ?", Integer.class,
@@ -81,15 +96,18 @@ class JobResultCompletionIntegrationTest {
     }
 
     @Test
-    void resultInsertFailureRollsBackAttemptClosureAndSucceededTransition() {
+    void resultInsertFailureRollsBackAttemptClosureAndSucceededTransition(CapturedOutput output) {
         Job queued = queued();
         ClaimedJob claim = store.claimNextEligible().orElseThrow();
+        double before = successCount();
         // Fault injection: a conflicting row causes the insert to fail after the attempt closure UPDATE.
         jdbc.update("insert into job_results (job_id, attempt_number, preview) values (?, ?, ?)",
                 queued.id(), claim.attemptNumber(), "existing row");
 
         assertThatThrownBy(() -> store.completeSuccess(claim, new ReportPreview("new preview")))
                 .isInstanceOf(DataIntegrityViolationException.class);
+        assertThat(successCount()).isEqualTo(before);
+        assertThat(output.getAll()).doesNotContain("event=job_completed attempt=1 outcome=SUCCEEDED");
         assertThat(store.findById(queued.id()).orElseThrow().status()).isEqualTo(JobStatus.RUNNING);
         assertThat(jdbc.queryForObject("select outcome from job_attempts where job_id = ? and attempt_number = ?",
                 String.class, queued.id(), claim.attemptNumber())).isNull();
@@ -100,6 +118,7 @@ class JobResultCompletionIntegrationTest {
 
         jdbc.update("delete from job_results where job_id = ?", queued.id());
         assertThat(store.completeSuccess(claim, new ReportPreview("new preview"))).isTrue();
+        assertThat(successCount()).isEqualTo(before + 1);
         assertThat(store.findById(queued.id()).orElseThrow().status()).isEqualTo(JobStatus.SUCCEEDED);
     }
 
@@ -110,5 +129,9 @@ class JobResultCompletionIntegrationTest {
 
     private int resultCount(UUID id) {
         return jdbc.queryForObject("select count(*) from job_results where job_id = ?", Integer.class, id);
+    }
+
+    private double successCount() {
+        return meters.get("taskforge.worker.completions").tag("outcome", "SUCCEEDED").counter().count();
     }
 }

@@ -23,7 +23,7 @@ class WorkerScheduler {
             worker.processOne();
         } catch (RuntimeException exception) {
             // No payload or exception message is logged; expired RUNNING jobs are checked on later cycles.
-            log.error("Worker cycle failed: {}", exception.getClass().getSimpleName());
+            log.error("event=worker_cycle_failed exception_type={}", exception.getClass().getSimpleName());
         }
     }
 }
