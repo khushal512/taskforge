@@ -108,12 +108,12 @@ The domain model and legal transitions are documented in [ADR 0001](docs/adr/000
 5. First background worker (Phase 5)
 6. Multiple workers and concurrency control (Phase 6)
 7. Retries, leases, and crash recovery (Phase 7)
-8. Redis integration, if it adds a justified benefit (Phase 8)
-9. Idempotency and further recovery refinements (planned Phase 9)
-10. Authentication and authorization (Phase 10)
+8. Job execution history API (Phase 8)
+9. Idempotent job submission (Phase 9)
+10. CI verification baseline (Phase 10)
 11. Expanded tests and quality checks (Phase 11)
 12. Logs, health, and metrics (Phase 12)
-13. Docker and CI (Phase 13)
+13. Docker packaging and deployment workflow (Phase 13)
 14. Architecture and portfolio documentation (Phase 14)
 
 Each phase is reviewed and tested before the next begins. See the Git history for the implementation steps.
