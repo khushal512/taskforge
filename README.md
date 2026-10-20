@@ -1,6 +1,15 @@
 # TaskForge
 
-TaskForge is a learning project for building a background job platform in small, tested phases. Phase 1 added a Spring Boot HTTP service and health route. Phase 2 added pure-Java job lifecycle rules. Phase 3 added PostgreSQL persistence. Phase 4 added job submission and lookup APIs. Phase 5 added a database-backed worker. Phase 6 made claims safe across competing workers. Phase 7 adds bounded retries, leases, and crash recovery.
+TaskForge is a Java 21/Spring Boot project for studying reliable background-job processing. Clients submit an allowlisted job through a REST API; PostgreSQL records its state, a worker executes it asynchronously, and clients can inspect attempts and a stored result. The only handler produces a **simulated text report preview**, not a report file or an external effect.
+
+What the current implementation demonstrates:
+
+- PostgreSQL-backed job state, Flyway migrations, and an explicit Java lifecycle.
+- Concurrent claims with `FOR UPDATE SKIP LOCKED`, bounded retries, leases, heartbeats, and recovery of expired attempts.
+- Optional idempotent submission, ordered attempt history, and durable report-preview retrieval.
+- Local health/readiness checks, process-local worker metrics, structured event logs, Java 21/Testcontainers verification, and Docker Compose packaging.
+
+The API is **unauthenticated and intended for trusted local development**. Database fencing prevents stale workers from changing TaskForge state; it does not provide exactly-once execution. See [current architecture](docs/architecture.md), the [copy-paste demo](docs/demo.md), and the [testing guide](docs/testing.md).
 
 ## Requirements
 
@@ -10,7 +19,7 @@ TaskForge is a learning project for building a background job platform in small,
 
 PostgreSQL runs through Docker Compose for local development; a Windows PostgreSQL installation is not needed.
 
-## Run locally
+## Quick start
 
 In PowerShell, from the repository root:
 
@@ -25,7 +34,7 @@ mvn spring-boot:run
 In another terminal:
 
 ```powershell
-Invoke-RestMethod http://localhost:8080/api/v1/health
+Invoke-RestMethod http://127.0.0.1:8080/api/v1/health
 ```
 
 The response is `{"status":"UP"}`. This route only confirms that the HTTP application responds; it does not check a database or a worker. The database connection and Flyway migrations are checked during application startup.
@@ -48,12 +57,22 @@ An existing PostgreSQL volume retains the password chosen when it was first init
 
 ## Job API
 
+| Endpoint | Purpose | Typical response |
+| --- | --- | --- |
+| `POST /api/v1/jobs` | Queue an allowlisted report-preview job. | `201 Created`; matching idempotency replay returns `200 OK`. |
+| `GET /api/v1/jobs/{id}` | Read current status and attempt count. | `200 OK`; unknown ID returns `404`. |
+| `GET /api/v1/jobs/{id}/attempts` | Read ordered execution history. | `200 OK`, including `[]` before the first attempt. |
+| `GET /api/v1/jobs/{id}/result` | Read the stored preview after success. | `200 OK`; unavailable results return a safe `409`. |
+| `GET /api/v1/health` | Check the legacy HTTP route. | `200 OK` with `{"status":"UP"}`. |
+
+The [demo guide](docs/demo.md) follows one job through submission, status polling, attempt history, and result retrieval. There is no list-all, manual retry, or cancellation endpoint.
+
 Submit a report job from PowerShell while the app is running:
 
 ```powershell
-$job = Invoke-RestMethod -Method Post -Uri http://localhost:8080/api/v1/jobs -ContentType 'application/json' -Body '{"jobType":"GENERATE_REPORT","payload":{"reportName":"Quarterly report"}}'
+$job = Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8080/api/v1/jobs -ContentType 'application/json' -Body '{"jobType":"GENERATE_REPORT","payload":{"reportName":"Quarterly report"}}'
 $job.id
-Invoke-RestMethod "http://localhost:8080/api/v1/jobs/$($job.id)"
+Invoke-RestMethod "http://127.0.0.1:8080/api/v1/jobs/$($job.id)"
 ```
 
 `POST /api/v1/jobs` without an `Idempotency-Key` header, or with a new key, returns `201 Created`, a `Location` header pointing to `/api/v1/jobs/{id}`, and the saved job. `GET /api/v1/jobs/{id}` returns that job with `200 OK`. The response includes its ID, job type, normalized payload, status, attempt count, creation and update times, and an optional terminal failure reason. New jobs have status `QUEUED` and attempt count `0`; the worker may change the status soon after the response. Poll GET to observe it. A retrying job can show `RETRY_WAIT`; `attemptCount` is the number of attempts **started**, not the number of retries scheduled.
@@ -69,7 +88,7 @@ Only `jobType` and `payload.reportName` are accepted in a submission. The server
 Inspect a job's execution attempts after submitting it:
 
 ```powershell
-Invoke-RestMethod "http://localhost:8080/api/v1/jobs/$($job.id)/attempts"
+Invoke-RestMethod "http://127.0.0.1:8080/api/v1/jobs/$($job.id)/attempts"
 ```
 
 `GET /api/v1/jobs/{id}/attempts` returns a JSON array in `attemptNumber` order. `startedAt` is the recorded or reconstructed start timestamp; `finishedAt` is when that attempt closed, or `null` while it is running. `outcome` describes that attempt: `RUNNING` is open, `RETRY_WAIT` means it ended and a retry was scheduled, and `SUCCEEDED` or `FAILED` records its final result. `failureReason` is a safe display reason for an attempt that failed or scheduled a retry; unfamiliar stored reasons are shown as `Job attempt failed`. `nextEligibleAt` is the time when that attempt's scheduled retry becomes eligible. Inapplicable `finishedAt`, `failureReason`, and `nextEligibleAt` fields are returned as JSON `null`.
@@ -104,7 +123,25 @@ Multiple TaskForge instances can claim different jobs. Skipping a locked older r
 
 **Upgrade from Phase 6:** Stop and confirm all Phase 6 application instances have exited before applying Flyway V3 or starting Phase 7 instances. Phase 6 workers can write terminal state without a lease or attempt-history check; mixed versions cannot safely share this schema. V3 marks any existing `RUNNING` job's lease expired so the new worker can recover it. Historical terminal attempts did not record an actual start time; their backfilled start is explicitly marked synthetic.
 
-The default HTTP port is 8080. To select another port for the current PowerShell session, set `$env:SERVER_PORT = '8081'` before starting the app. `DATABASE_URL` defaults to `jdbc:postgresql://localhost:5432/taskforge` and `DATABASE_USERNAME` defaults to `taskforge`. If you change the Compose database name or host port, adjust `DATABASE_URL` too. The password has no usable default: supply `DATABASE_PASSWORD` in the shell. `.env.example` lists configuration names but contains no credential. Compose can read an ignored `.env` file; Spring Boot reads the shell environment, not that file. Never commit a real `.env` file.
+## Configuration reference
+
+These are the current local defaults from `application.yml`, `compose.yaml`, and `.env.example`. Compose overrides the app's database URL and bind address inside its container.
+
+| Variable | Default or requirement | Use |
+| --- | --- | --- |
+| `SERVER_ADDRESS` | `127.0.0.1`; Compose app uses `0.0.0.0` internally | Spring HTTP bind address. Compose still publishes the host port only on `127.0.0.1`. |
+| `SERVER_PORT` | `8080` | Spring HTTP port; Compose uses it for the host port and keeps container port 8080. |
+| `DATABASE_URL` | `jdbc:postgresql://localhost:5432/taskforge` | JDBC URL for Maven startup; Compose app uses `postgres:5432` and `DATABASE_NAME`. |
+| `DATABASE_NAME`, `DATABASE_USERNAME` | `taskforge` | Compose PostgreSQL database and user; username also defaults in Spring. |
+| `DATABASE_PORT` | `5432` | Host-published PostgreSQL port, bound to loopback. Adjust `DATABASE_URL` for Maven if changed. |
+| `DATABASE_PASSWORD` | Required for Compose; no usable Spring default | Set in the shell or an ignored Compose `.env`; never commit it. |
+| `WORKER_SCHEDULING_ENABLED` | `true` | Set `false` to disable automatic polling. |
+| `WORKER_POLL_DELAY_MS` | `1000` | Fixed delay after a scheduled worker cycle. |
+| `WORKER_MAX_ATTEMPTS` | `3` | Maximum started attempts for newly submitted jobs. |
+| `WORKER_RETRY_BASE_DELAY_MS`, `WORKER_RETRY_DELAY_CAP_MS` | `5000`, `300000` | Exponential retry delay and cap, in milliseconds. |
+| `WORKER_LEASE_DURATION_MS`, `WORKER_HEARTBEAT_INTERVAL_MS` | `30000`, `10000` | Lease and renewal interval, in milliseconds. |
+
+To change the HTTP port for a Maven run, set `$env:SERVER_PORT = '8081'` in that PowerShell session. `.env.example` contains names and placeholders only. Compose can read an ignored `.env` file; Spring Boot reads shell environment variables, not that file. Never commit a real `.env` file.
 
 `mvn verify` starts an isolated PostgreSQL Testcontainers instance, so Docker must be running even if the Compose database is stopped. Stop the local database with `docker compose down` when finished. The named volume retains its data; deleting it would remove local jobs.
 
@@ -112,7 +149,16 @@ The PostgreSQL JDBC driver sends the JVM timezone name when connecting. This Win
 
 On some Codex terminals, Java may report `user.home=C:\` even when `USERPROFILE` points to the Windows account. If Maven reports an inaccessible `C:\.m2\repository`, set `$env:MAVEN_OPTS = "-Duser.home=$env:USERPROFILE"` for that terminal session, then rerun Maven. This does not change machine-wide configuration.
 
-## Current architecture
+## Known limitations and architecture
+
+- The API has no authentication, user ownership, quotas, or rate limiting. Loopback binding is a local development boundary, not authorization.
+- `GENERATE_REPORT` creates a bounded text preview. No downloadable report, email, payment, or other external side effect is implemented.
+- Worker claims and database writes are fenced, but an old handler may keep running after losing its lease. A crash after handler work can cause another attempt; exactly-once execution and external effects are not guaranteed.
+- Idempotency keys are globally scoped and retained without expiry. They prevent duplicate **job creation** for a retained key, not duplicate handler effects.
+- Metrics reset on process restart and are not aggregated across instances. `/actuator/metrics` is not exposed over HTTP.
+- The built-in scheduler runs one handler at a time per instance. There is no Redis queue, cloud deployment, or public security configuration.
+
+The [architecture guide](docs/architecture.md) explains the current components, state machine, tables, and transaction boundaries. PostgreSQL is the authoritative record of job state and result; Redis is not required by this implementation.
 
 ```text
 HTTP client → JobController → JobApplicationService → domain Job → JpaJobStore → PostgreSQL
@@ -121,9 +167,9 @@ WorkerScheduler → JobWorker → JpaJobStore → PostgreSQL
 HTTP client → HealthController → HealthResponse JSON
 ```
 
-`com.taskforge` is the application root. The `api` package contains HTTP DTOs, controllers, and safe error mapping. The `application` package coordinates use cases and supplies a testable clock. The `domain` package contains pure-Java job lifecycle rules. The `persistence` package maps a domain `Job` to a JPA row. The `worker` package schedules cycles and runs allowlisted handlers. Flyway creates the schema and Hibernate validates it. PostgreSQL is the source of truth for job state. Redis will be evaluated only after the database-backed worker is understood and tested.
+`com.taskforge` is the application root. The `api` package handles HTTP and safe error mapping; `application` coordinates use cases; `domain` holds pure-Java lifecycle rules; `persistence` maps jobs to PostgreSQL; and `worker` schedules and runs allowlisted handlers. Flyway creates the schema and Hibernate validates it.
 
-The domain model and legal transitions are documented in [ADR 0001](docs/adr/0001-job-domain.md). The persistence design and limits are documented in [ADR 0002](docs/adr/0002-postgres-persistence.md). The first worker design is documented in [ADR 0003](docs/adr/0003-first-worker.md); its concurrent claim is documented in [ADR 0004](docs/adr/0004-concurrent-claiming.md). [ADR 0005](docs/adr/0005-retries-leases-recovery.md) records the revised Phase 7 retry and ownership rules; earlier ADRs describe the design at their respective phases.
+ADRs [0001](docs/adr/0001-job-domain.md), [0002](docs/adr/0002-postgres-persistence.md), [0003](docs/adr/0003-first-worker.md), [0004](docs/adr/0004-concurrent-claiming.md), and [0005](docs/adr/0005-retries-leases-recovery.md) are historical design records. In particular, ADRs 0001–0003 describe earlier single-attempt or single-worker phases; read the current architecture guide for today's behavior.
 
 ## Development sequence
 
