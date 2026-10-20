@@ -1,5 +1,6 @@
 package com.taskforge.worker;
 
+import com.taskforge.domain.ReportPreview;
 import com.taskforge.persistence.ClaimedJob;
 import com.taskforge.persistence.JpaJobStore;
 import org.springframework.stereotype.Service;
@@ -30,11 +31,10 @@ public class JobWorker {
         try (LeaseHeartbeat.Ownership ownership = heartbeat.start(claim)) {
             String failureReason = null;
             boolean retryable = false;
+            ReportPreview preview = null;
             try {
-                String preview = handlers.require(claim.job().jobType()).execute(claim.job().payload());
-                if (preview == null || preview.isBlank()) {
-                    throw new IllegalStateException("Handler returned an empty preview");
-                }
+                preview = new ReportPreview(handlers.require(claim.job().jobType())
+                        .execute(claim.job().payload()));
             } catch (RetryableJobException exception) {
                 failureReason = "Temporary job execution failure";
                 retryable = true;
@@ -46,7 +46,7 @@ public class JobWorker {
 
             if (ownership.active()) {
                 if (failureReason == null) {
-                    store.completeSuccess(claim);
+                    store.completeSuccess(claim, preview);
                 } else {
                     store.completeFailure(claim, retryable, failureReason);
                 }

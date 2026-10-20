@@ -72,7 +72,7 @@ class ConsistentJobReadIntegrationTest {
             });
             assertThat(rowRead.await(10, TimeUnit.SECONDS)).isTrue();
             assertThat(isolation.get()).isEqualTo("repeatable read");
-            assertThat(store.completeSuccess(claim)).isTrue();
+            assertThat(store.completeSuccess(claim, new com.taskforge.domain.ReportPreview("Simulated report preview"))).isTrue();
             continueRead.countDown();
 
             // The job row and history both come from the pre-completion snapshot.
@@ -103,9 +103,44 @@ class ConsistentJobReadIntegrationTest {
                 }
             });
             assertThat(rowRead.await(10, TimeUnit.SECONDS)).isTrue();
-            assertThat(store.completeSuccess(claim)).isTrue();
+            assertThat(store.completeSuccess(claim, new com.taskforge.domain.ReportPreview("Simulated report preview"))).isTrue();
             continueRead.countDown();
             result.get(10, TimeUnit.SECONDS);
+        } finally {
+            continueRead.countDown();
+            reader.shutdownNow();
+            assertThat(reader.awaitTermination(10, TimeUnit.SECONDS)).isTrue();
+        }
+    }
+
+    @Test
+    void resultGetUsesOneSnapshotWhenCompletionCommitsDuringRead() throws Exception {
+        ClaimedJob claim = claimJob();
+        CountDownLatch rowRead = new CountDownLatch(1);
+        CountDownLatch continueRead = new CountDownLatch(1);
+        AtomicReference<String> isolation = new AtomicReference<>();
+        pauseAfterJobRowRead(claim.id(), rowRead, continueRead, isolation);
+        ExecutorService reader = Executors.newSingleThreadExecutor();
+        try {
+            Future<?> result = reader.submit(() -> {
+                try {
+                    mvc.perform(get("/api/v1/jobs/{id}/result", claim.id()))
+                            .andExpect(status().isConflict())
+                            .andExpect(jsonPath("$.code").value("RESULT_NOT_READY"));
+                } catch (Exception exception) {
+                    throw new AssertionError("GET should use one result snapshot", exception);
+                }
+            });
+            assertThat(rowRead.await(10, TimeUnit.SECONDS)).isTrue();
+            assertThat(isolation.get()).isEqualTo("repeatable read");
+            assertThat(store.completeSuccess(claim, new com.taskforge.domain.ReportPreview("Simulated report preview")))
+                    .isTrue();
+            continueRead.countDown();
+            result.get(10, TimeUnit.SECONDS);
+
+            mvc.perform(get("/api/v1/jobs/{id}/result", claim.id()))
+                    .andExpect(status().isOk())
+                    .andExpect(jsonPath("$.preview").value("Simulated report preview"));
         } finally {
             continueRead.countDown();
             reader.shutdownNow();
@@ -128,7 +163,7 @@ class ConsistentJobReadIntegrationTest {
             isolation.set(jdbc.queryForObject("show transaction_isolation", String.class));
             rowRead.countDown();
             if (!continueRead.await(10, TimeUnit.SECONDS)) {
-                throw new AssertionError("Timed out waiting to read attempt history");
+                throw new AssertionError("Timed out waiting to continue snapshot read");
             }
             return row;
         }).when(repository).findById(id);

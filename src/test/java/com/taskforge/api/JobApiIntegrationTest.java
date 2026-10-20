@@ -90,7 +90,7 @@ class JobApiIntegrationTest {
 
         ClaimedJob claim = store.claimNextEligible().orElseThrow();
         assertThat(claim.id()).isEqualTo(id);
-        assertThat(store.completeSuccess(claim)).isTrue();
+        assertThat(store.completeSuccess(claim, new com.taskforge.domain.ReportPreview("Simulated report preview"))).isTrue();
 
         MvcResult replay = postReport("Report", "state-change-key");
         assertThat(replay.getResponse().getStatus()).isEqualTo(200);
@@ -237,7 +237,7 @@ class JobApiIntegrationTest {
                 .andExpect(jsonPath("$[0].payload").doesNotExist())
                 .andExpect(jsonPath("$[0].leaseExpiresAt").doesNotExist());
 
-        assertThat(store.completeSuccess(claim)).isTrue();
+        assertThat(store.completeSuccess(claim, new com.taskforge.domain.ReportPreview("Simulated report preview"))).isTrue();
         mvc.perform(get("/api/v1/jobs/{id}/attempts", id))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$[0].outcome").value("SUCCEEDED"))

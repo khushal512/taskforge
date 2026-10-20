@@ -49,4 +49,9 @@ public class JobController {
     public List<JobAttemptResponse> attempts(@PathVariable UUID id) {
         return service.getAttempts(id).stream().map(JobAttemptResponse::from).toList();
     }
+
+    @GetMapping("/{id}/result")
+    public JobResultResponse result(@PathVariable UUID id) {
+        return JobResultResponse.from(id, service.getResult(id));
+    }
 }

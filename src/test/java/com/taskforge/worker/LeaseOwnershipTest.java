@@ -140,7 +140,7 @@ class LeaseOwnershipTest {
 
         JobWorker worker = new JobWorker(store, new JobHandlerRegistry(List.of(handler)), heartbeat);
         assertThat(worker.processOne()).isTrue();
-        verify(store, never()).completeSuccess(any());
+        verify(store, never()).completeSuccess(any(), any());
         verify(store, never()).completeFailure(any(), anyBoolean(), any());
     }
 
@@ -162,7 +162,7 @@ class LeaseOwnershipTest {
 
         JobWorker worker = new JobWorker(store, new JobHandlerRegistry(List.of(handler)), heartbeat);
         assertThat(worker.processOne()).isTrue();
-        verify(store, never()).completeSuccess(any());
+        verify(store, never()).completeSuccess(any(), any());
         verify(store, never()).completeFailure(any(), anyBoolean(), any());
     }
 
@@ -184,7 +184,7 @@ class LeaseOwnershipTest {
 
         JobWorker worker = new JobWorker(store, new JobHandlerRegistry(List.of(handler)), heartbeat);
         assertThat(worker.processOne()).isTrue();
-        verify(store, never()).completeSuccess(any());
+        verify(store, never()).completeSuccess(any(), any());
         verify(store, never()).completeFailure(any(), anyBoolean(), any());
     }
 

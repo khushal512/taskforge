@@ -88,6 +88,10 @@ class JobWorkerIntegrationTest {
         assertThat(finished.createdAt()).isEqualTo(queued.createdAt());
         assertThat(finished.updatedAt()).isAfterOrEqualTo(queued.updatedAt());
         assertThat(finished.failureReason()).isEmpty();
+        assertThat(jdbc.queryForObject("select preview from job_results where job_id = ?", String.class,
+                queued.id())).isEqualTo("Simulated report preview");
+        assertThat(jdbc.queryForObject("select attempt_number from job_results where job_id = ?", Integer.class,
+                queued.id())).isEqualTo(1);
         assertThat(worker.processOne()).isFalse();
     }
 
@@ -107,6 +111,32 @@ class JobWorkerIntegrationTest {
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.status").value("SUCCEEDED"))
                 .andExpect(jsonPath("$.attemptCount").value(1));
+    }
+
+    @Test
+    void postWorkerAndResultGetReadsStoredPreviewWithoutRerunningHandler() throws Exception {
+        String body = mvc.perform(post("/api/v1/jobs").contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"jobType\":\"GENERATE_REPORT\",\"payload\":{\"reportName\":\"Quarterly report\"}}"))
+                .andExpect(status().isCreated())
+                .andReturn().getResponse().getContentAsString();
+        UUID id = UUID.fromString(json.readTree(body).get("id").asText());
+
+        assertThat(worker.processOne()).isTrue();
+        assertThat(probe.calls).isEqualTo(1);
+        for (int read = 0; read < 2; read++) {
+            mvc.perform(get("/api/v1/jobs/{id}/result", id))
+                    .andExpect(status().isOk())
+                    .andExpect(jsonPath("$.jobId").value(id.toString()))
+                    .andExpect(jsonPath("$.attemptNumber").value(1))
+                    .andExpect(jsonPath("$.preview").value("Simulated report preview"))
+                    .andExpect(jsonPath("$.payload").doesNotExist())
+                    .andExpect(jsonPath("$.leaseExpiresAt").doesNotExist())
+                    .andExpect(jsonPath("$.failureReason").doesNotExist())
+                    .andExpect(jsonPath("$.trace").doesNotExist());
+        }
+        assertThat(probe.calls).isEqualTo(1);
+        assertThat(jdbc.queryForObject("select count(*) from job_results where job_id = ?", Integer.class,
+                id)).isEqualTo(1);
     }
 
     @Test

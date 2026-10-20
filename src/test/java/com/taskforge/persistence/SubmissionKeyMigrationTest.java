@@ -28,7 +28,7 @@ class SubmissionKeyMigrationTest {
 
         UUID existingJob = insertQueuedJob(jdbc);
         UUID anotherJob = insertQueuedJob(jdbc);
-        Flyway flyway = Flyway.configure().dataSource(dataSource).load();
+        Flyway flyway = Flyway.configure().dataSource(dataSource).target("4").load();
         assertThat(flyway.migrate().migrationsExecuted).isEqualTo(1);
         assertThat(flyway.info().current().getVersion().getVersion()).isEqualTo("4");
         assertThat(jdbc.queryForObject("select count(*) from jobs", Integer.class)).isEqualTo(2);

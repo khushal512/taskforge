@@ -77,7 +77,7 @@ class RetryRecoveryIntegrationTest {
         expireLease(queued.id());
 
         assertThat(store.renewLease(first.id(), first.attemptNumber())).isFalse();
-        assertThat(store.completeSuccess(first)).isFalse();
+        assertThat(store.completeSuccess(first, new com.taskforge.domain.ReportPreview("Simulated report preview"))).isFalse();
         assertThat(store.recoverOneExpired()).isTrue();
         assertThat(store.recoverOneExpired()).isFalse();
         assertThat(store.findById(queued.id()).orElseThrow().status()).isEqualTo(JobStatus.RETRY_WAIT);
@@ -90,7 +90,7 @@ class RetryRecoveryIntegrationTest {
         assertThat(store.findById(queued.id()).orElseThrow().status()).isEqualTo(JobStatus.RUNNING);
         assertThat(jdbc.queryForObject("select outcome from job_attempts where job_id = ? and attempt_number = 2",
                 String.class, queued.id())).isNull();
-        assertThat(store.completeSuccess(second)).isTrue();
+        assertThat(store.completeSuccess(second, new com.taskforge.domain.ReportPreview("Simulated report preview"))).isTrue();
     }
 
     @Test

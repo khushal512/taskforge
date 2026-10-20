@@ -64,11 +64,17 @@ The history keeps each attempt's outcome. An earlier attempt can therefore show 
 
 An existing job with no started attempts returns `200 OK` with `[]`. An unknown valid UUID returns the existing safe `404` response; a malformed UUID returns `400`. This endpoint is currently unauthenticated and intended for local development only. Do not expose it publicly until authentication and job ownership checks are implemented.
 
+### Report preview result
+
+After a job succeeds, retrieve its stored text preview with `GET /api/v1/jobs/{id}/result`. A successful response is `200 OK` with `jobId`, the successful `attemptNumber`, and `preview`. This reads PostgreSQL; it does not rerun the handler or create a report file.
+
+An existing `QUEUED`, `RUNNING`, or `RETRY_WAIT` job returns `409 Conflict` with code `RESULT_NOT_READY`. A `FAILED` job returns `409` with `RESULT_FAILED`. A historical `SUCCEEDED` job without a stored preview returns `409` with `RESULT_UNAVAILABLE`; TaskForge does not invent a result for it. These responses use the usual `code`, `message`, and `fieldErrors` error body. An unknown valid job ID returns `404 JOB_NOT_FOUND`, and a malformed UUID returns `400 INVALID_REQUEST`. Like the other job APIs, this endpoint is unauthenticated and intended only for local development.
+
 ## Database-backed worker
 
 One scheduled worker cycle first checks one expired `RUNNING` job for recovery, then claims an eligible `QUEUED` or `RETRY_WAIT` job with PostgreSQL `FOR UPDATE SKIP LOCKED`. The claim transaction applies `start()`, records the numbered attempt, sets a lease, and commits `RUNNING` before the handler executes. A separate heartbeat thread can renew the lease during a slow handler. Completion and recovery use short, guarded transactions that lock the job and update its exact attempt record together. The handler runs outside database transactions. A competing worker skips a locked row and may take another job.
 
-Only an explicitly retryable handler error or an expired lease schedules another attempt. Other handler errors fail permanently with a fixed safe reason. The default maximum is three started attempts. After failed attempt 1, the job waits 5 seconds; after attempt 2, 10 seconds; after attempt 3 it becomes `FAILED`. The delay doubles up to a 5-minute cap. PostgreSQL stores the next eligible time; no thread or transaction waits through backoff. The only production handler builds a deterministic report **preview in memory**. No report file, download, or external service exists; the preview is not stored. `SUCCEEDED` means this simulation completed, not that a deliverable report was generated.
+Only an explicitly retryable handler error or an expired lease schedules another attempt. Other handler errors fail permanently with a fixed safe reason. The default maximum is three started attempts. After failed attempt 1, the job waits 5 seconds; after attempt 2, 10 seconds; after attempt 3 it becomes `FAILED`. The delay doubles up to a 5-minute cap. PostgreSQL stores the next eligible time; no thread or transaction waits through backoff. The only production handler builds a deterministic text report preview. Successful completion stores that preview with the successful attempt in PostgreSQL. No report file, download, or external service exists. `SUCCEEDED` means this simulation completed, not that a deliverable report was generated.
 
 The worker checks at most one abandoned job and processes at most one eligible job per tick. `WORKER_POLL_DELAY_MS` defaults to `1000` milliseconds between completed ticks. Set `WORKER_SCHEDULING_ENABLED=false` to disable automatic polling, for example while inspecting queued jobs locally. `WORKER_MAX_ATTEMPTS`, `WORKER_RETRY_BASE_DELAY_MS`, `WORKER_RETRY_DELAY_CAP_MS`, `WORKER_LEASE_DURATION_MS`, and `WORKER_HEARTBEAT_INTERVAL_MS` have safe defaults shown in `.env.example`. Invalid limits prevent startup. The maximum is stored per submitted job; changing it later affects only new jobs. The POST endpoint still saves jobs without executing handlers in the request thread.
 
@@ -111,7 +117,7 @@ The domain model and legal transitions are documented in [ADR 0001](docs/adr/000
 8. Job execution history API (Phase 8)
 9. Idempotent job submission (Phase 9)
 10. CI verification baseline (Phase 10)
-11. Expanded tests and quality checks (Phase 11)
+11. Durable report previews and result retrieval API (Phase 11)
 12. Logs, health, and metrics (Phase 12)
 13. Docker packaging and deployment workflow (Phase 13)
 14. Architecture and portfolio documentation (Phase 14)

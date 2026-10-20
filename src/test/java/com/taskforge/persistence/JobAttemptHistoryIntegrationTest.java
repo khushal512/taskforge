@@ -70,7 +70,7 @@ class JobAttemptHistoryIntegrationTest {
 
         makeRetryDue(queued.id());
         ClaimedJob second = store.claimNextEligible().orElseThrow();
-        assertThat(store.completeSuccess(second)).isTrue();
+        assertThat(store.completeSuccess(second, new com.taskforge.domain.ReportPreview("Simulated report preview"))).isTrue();
 
         List<JobAttemptView> history = store.findAttemptHistory(queued.id()).orElseThrow();
         assertThat(history).extracting(JobAttemptView::attemptNumber).containsExactly(1, 2);
@@ -92,7 +92,7 @@ class JobAttemptHistoryIntegrationTest {
         assertThat(store.findAttemptHistory(runningJob.id()).orElseThrow().getFirst().startTimeSource())
                 .isEqualTo(JobAttemptView.StartTimeSource.LEGACY_DERIVED);
 
-        assertThat(store.completeSuccess(running)).isTrue();
+        assertThat(store.completeSuccess(running, new com.taskforge.domain.ReportPreview("Simulated report preview"))).isTrue();
         jdbc.update("""
                 update job_attempts set started_at = ?, started_at_nano_remainder = ?,
                     start_time_source = 'LEGACY_SYNTHETIC' where job_id = ?
@@ -140,7 +140,7 @@ class JobAttemptHistoryIntegrationTest {
             });
             assertThat(rowRead.await(10, TimeUnit.SECONDS)).isTrue();
             assertThat(isolation.get()).isEqualTo("repeatable read");
-            assertThat(store.completeSuccess(claim)).isTrue();
+            assertThat(store.completeSuccess(claim, new com.taskforge.domain.ReportPreview("Simulated report preview"))).isTrue();
             continueRead.countDown();
 
             assertThat(result.get(10, TimeUnit.SECONDS)).singleElement().satisfies(attempt -> {

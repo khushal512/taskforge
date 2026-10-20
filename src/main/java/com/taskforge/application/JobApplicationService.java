@@ -5,6 +5,7 @@ import com.taskforge.domain.JobType;
 import com.taskforge.domain.ReportPayload;
 import com.taskforge.persistence.JpaJobStore;
 import com.taskforge.persistence.JobAttemptView;
+import com.taskforge.persistence.JobResultSnapshot;
 import com.taskforge.persistence.StoredSubmission;
 import com.taskforge.persistence.SubmissionKeyAlreadyExistsException;
 import org.springframework.stereotype.Service;
@@ -72,5 +73,17 @@ public class JobApplicationService {
     public List<JobAttemptView> getAttempts(UUID id) {
         return store.findAttemptHistory(Objects.requireNonNull(id, "id"))
                 .orElseThrow(() -> new JobNotFoundException(id));
+    }
+
+    public JobResultSnapshot.Result getResult(UUID id) {
+        JobResultSnapshot snapshot = store.findResult(Objects.requireNonNull(id, "id"))
+                .orElseThrow(() -> new JobNotFoundException(id));
+        return switch (snapshot.job().status()) {
+            case QUEUED, RUNNING, RETRY_WAIT ->
+                    throw new JobResultUnavailableException(JobResultUnavailableException.Reason.NOT_READY);
+            case FAILED -> throw new JobResultUnavailableException(JobResultUnavailableException.Reason.FAILED);
+            case SUCCEEDED -> snapshot.result().orElseThrow(() ->
+                    new JobResultUnavailableException(JobResultUnavailableException.Reason.LEGACY_MISSING));
+        };
     }
 }

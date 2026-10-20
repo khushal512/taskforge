@@ -3,6 +3,7 @@ package com.taskforge.api;
 import com.taskforge.application.InvalidJobRequestException;
 import com.taskforge.application.IdempotencyConflictException;
 import com.taskforge.application.JobNotFoundException;
+import com.taskforge.application.JobResultUnavailableException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
@@ -58,6 +59,18 @@ public class ApiExceptionHandler {
     @ExceptionHandler(JobNotFoundException.class)
     ResponseEntity<ApiError> missingJob(JobNotFoundException exception) {
         return error(HttpStatus.NOT_FOUND, "JOB_NOT_FOUND", exception.getMessage());
+    }
+
+    @ExceptionHandler(JobResultUnavailableException.class)
+    ResponseEntity<ApiError> resultUnavailable(JobResultUnavailableException exception) {
+        return switch (exception.reason()) {
+            case NOT_READY -> error(HttpStatus.CONFLICT, "RESULT_NOT_READY",
+                    "Job result is not yet available");
+            case FAILED -> error(HttpStatus.CONFLICT, "RESULT_FAILED",
+                    "Failed job has no successful result");
+            case LEGACY_MISSING -> error(HttpStatus.CONFLICT, "RESULT_UNAVAILABLE",
+                    "No stored result is available for this successful job");
+        };
     }
 
     @ExceptionHandler(NoResourceFoundException.class)

@@ -3,6 +3,7 @@ package com.taskforge.persistence;
 import com.taskforge.application.JobExecutionSettings;
 import com.taskforge.domain.Job;
 import com.taskforge.domain.JobStatus;
+import com.taskforge.domain.ReportPreview;
 import jakarta.persistence.EntityManager;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Repository;
@@ -15,6 +16,7 @@ import java.sql.SQLException;
 import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.util.List;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -100,6 +102,19 @@ public class JpaJobStore {
         });
     }
 
+    /** The validated job and its result must come from the same PostgreSQL snapshot. */
+    @Transactional(readOnly = true, isolation = Isolation.REPEATABLE_READ, propagation = Propagation.REQUIRES_NEW)
+    public Optional<JobResultSnapshot> findResult(UUID id) {
+        return repository.findById(id).map(row -> {
+            Job job = toDomain(row);
+            List<JobResultSnapshot.Result> results = jdbc.query("""
+                    SELECT attempt_number, preview FROM job_results WHERE job_id = ?
+                    """, (rs, number) -> new JobResultSnapshot.Result(
+                    rs.getInt("attempt_number"), rs.getString("preview")), id);
+            return new JobResultSnapshot(job, results.stream().findFirst());
+        });
+    }
+
     /** Commits RUNNING and its attempt before the caller executes a handler. */
     @Transactional
     public Optional<ClaimedJob> claimNextEligible() {
@@ -161,7 +176,8 @@ public class JpaJobStore {
     }
 
     @Transactional
-    public boolean completeSuccess(ClaimedJob claim) {
+    public boolean completeSuccess(ClaimedJob claim, ReportPreview preview) {
+        Objects.requireNonNull(preview, "preview");
         JobEntity row = repository.findByIdForUpdate(claim.id()).orElse(null);
         if (row == null) {
             return false;
@@ -173,6 +189,8 @@ public class JpaJobStore {
         Job running = toDomain(row);
         Job succeeded = running.succeed(transitionAt(running, dbNow));
         closeAttempt(claim.id(), claim.attemptNumber(), succeeded, null);
+        jdbc.update("INSERT INTO job_results (job_id, attempt_number, preview) VALUES (?, ?, ?)",
+                claim.id(), claim.attemptNumber(), preview.text());
         row.replaceWith(mapper.toEntity(succeeded, null));
         repository.flush();
         return true;

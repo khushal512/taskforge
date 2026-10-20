@@ -44,7 +44,7 @@ class JpaJobStoreIntegrationTest {
 
     @Test
     void flywayCreatesSchemaOnce() {
-        assertThat(flyway.info().current().getVersion().getVersion()).isEqualTo("4");
+        assertThat(flyway.info().current().getVersion().getVersion()).isEqualTo("5");
         assertThat(flyway.migrate().migrationsExecuted).isZero();
         assertThat(jdbc.queryForObject("select count(*) from information_schema.tables "
                 + "where table_schema = 'public' and table_name = 'jobs'", Integer.class)).isEqualTo(1);
@@ -63,7 +63,7 @@ class JpaJobStoreIntegrationTest {
         assertThat(running.job().attemptCount()).isEqualTo(1);
         assertSameFields(running.job(), store.findById(queued.id()).orElseThrow());
 
-        assertThat(store.completeSuccess(running)).isTrue();
+        assertThat(store.completeSuccess(running, new com.taskforge.domain.ReportPreview("Simulated report preview"))).isTrue();
         Job succeeded = store.findById(queued.id()).orElseThrow();
         assertThat(succeeded.status()).isEqualTo(com.taskforge.domain.JobStatus.SUCCEEDED);
         assertThat(succeeded.createdAt()).isEqualTo(createdAt);
