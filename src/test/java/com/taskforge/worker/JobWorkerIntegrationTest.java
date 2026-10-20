@@ -1,0 +1,317 @@
+package com.taskforge.worker;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.taskforge.domain.Job;
+import com.taskforge.domain.JobPayload;
+import com.taskforge.domain.JobStatus;
+import com.taskforge.domain.JobType;
+import com.taskforge.domain.ReportPayload;
+import com.taskforge.observability.WorkerMetrics;
+import com.taskforge.persistence.JpaJobStore;
+import io.micrometer.core.instrument.MeterRegistry;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.context.TestConfiguration;
+import org.springframework.boot.test.system.CapturedOutput;
+import org.springframework.boot.test.system.OutputCaptureExtension;
+import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
+import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Primary;
+import org.springframework.http.MediaType;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.test.web.servlet.MockMvc;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
+import org.testcontainers.containers.PostgreSQLContainer;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.junit.jupiter.Testcontainers;
+import org.junit.jupiter.api.extension.ExtendWith;
+
+import java.time.Instant;
+import java.util.List;
+import java.util.UUID;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
+
+@SpringBootTest(properties = "taskforge.worker.scheduling-enabled=false")
+@AutoConfigureMockMvc
+@Testcontainers
+@ExtendWith(OutputCaptureExtension.class)
+class JobWorkerIntegrationTest {
+
+    @Container
+    @ServiceConnection
+    static PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>("postgres:17.11");
+
+    @Autowired
+    private JpaJobStore store;
+
+    @Autowired
+    private JobWorker worker;
+
+    @Autowired
+    private WorkerMetrics metrics;
+
+    @Autowired
+    private MeterRegistry meterRegistry;
+
+    @Autowired
+    private LeaseHeartbeat heartbeat;
+
+    @Autowired
+    private JobHandlerRegistry registry;
+
+    private ProbeHandler probe;
+
+    @Autowired
+    private JdbcTemplate jdbc;
+
+    @Autowired
+    private MockMvc mvc;
+
+    @Autowired
+    private ObjectMapper json;
+
+    @BeforeEach
+    void clearJobsAndProbe() {
+        jdbc.update("delete from jobs");
+        probe = (ProbeHandler) registry.require(JobType.GENERATE_REPORT);
+        probe.reset();
+    }
+
+    @Test
+    void commitsRunningBeforeHandlerAndPersistsSuccess(CapturedOutput output) {
+        Job queued = saveQueued(0);
+        double claimsBefore = count("taskforge.worker.claims");
+        double successBefore = count("taskforge.worker.completions", "outcome", "SUCCEEDED");
+        long timedBefore = meterRegistry.get("taskforge.worker.handler.duration").timer().count();
+
+        assertThat(worker.processOne()).isTrue();
+        assertThat(count("taskforge.worker.claims")).isEqualTo(claimsBefore + 1);
+        assertThat(count("taskforge.worker.completions", "outcome", "SUCCEEDED"))
+                .isEqualTo(successBefore + 1);
+        assertThat(meterRegistry.get("taskforge.worker.handler.duration").timer().count())
+                .isEqualTo(timedBefore + 1);
+
+        assertThat(probe.statusSeenDuringHandler).isEqualTo("RUNNING");
+        assertThat(probe.attemptsSeenDuringHandler).isEqualTo(1);
+        assertThat(probe.transactionActiveDuringHandler).isFalse();
+        Job finished = store.findById(queued.id()).orElseThrow();
+        assertThat(finished.status()).isEqualTo(JobStatus.SUCCEEDED);
+        assertThat(finished.attemptCount()).isEqualTo(1);
+        assertThat(finished.createdAt()).isEqualTo(queued.createdAt());
+        assertThat(finished.updatedAt()).isAfterOrEqualTo(queued.updatedAt());
+        assertThat(finished.failureReason()).isEmpty();
+        assertThat(jdbc.queryForObject("select preview from job_results where job_id = ?", String.class,
+                queued.id())).isEqualTo("Simulated report preview");
+        assertThat(jdbc.queryForObject("select attempt_number from job_results where job_id = ?", Integer.class,
+                queued.id())).isEqualTo(1);
+        assertThat(worker.processOne()).isFalse();
+        assertThat(eventLines(output)).containsExactlyInAnyOrder(
+                "event=job_claimed attempt=1", "event=job_completed attempt=1 outcome=SUCCEEDED");
+    }
+
+    @Test
+    void postOnlyQueuesAndLaterWorkerCycleCompletesTheJob() throws Exception {
+        String body = mvc.perform(post("/api/v1/jobs").contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"jobType\":\"GENERATE_REPORT\",\"payload\":{\"reportName\":\"Quarterly report\"}}"))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.status").value("QUEUED"))
+                .andReturn().getResponse().getContentAsString();
+        UUID id = UUID.fromString(json.readTree(body).get("id").asText());
+
+        assertThat(store.findById(id).orElseThrow().status()).isEqualTo(JobStatus.QUEUED);
+        assertThat(worker.processOne()).isTrue();
+
+        mvc.perform(get("/api/v1/jobs/{id}", id))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("SUCCEEDED"))
+                .andExpect(jsonPath("$.attemptCount").value(1));
+    }
+
+    @Test
+    void postWorkerAndResultGetReadsStoredPreviewWithoutRerunningHandler() throws Exception {
+        String body = mvc.perform(post("/api/v1/jobs").contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"jobType\":\"GENERATE_REPORT\",\"payload\":{\"reportName\":\"Quarterly report\"}}"))
+                .andExpect(status().isCreated())
+                .andReturn().getResponse().getContentAsString();
+        UUID id = UUID.fromString(json.readTree(body).get("id").asText());
+
+        assertThat(worker.processOne()).isTrue();
+        assertThat(probe.calls).isEqualTo(1);
+        for (int read = 0; read < 2; read++) {
+            mvc.perform(get("/api/v1/jobs/{id}/result", id))
+                    .andExpect(status().isOk())
+                    .andExpect(jsonPath("$.jobId").value(id.toString()))
+                    .andExpect(jsonPath("$.attemptNumber").value(1))
+                    .andExpect(jsonPath("$.preview").value("Simulated report preview"))
+                    .andExpect(jsonPath("$.payload").doesNotExist())
+                    .andExpect(jsonPath("$.leaseExpiresAt").doesNotExist())
+                    .andExpect(jsonPath("$.failureReason").doesNotExist())
+                    .andExpect(jsonPath("$.trace").doesNotExist());
+        }
+        assertThat(probe.calls).isEqualTo(1);
+        assertThat(jdbc.queryForObject("select count(*) from job_results where job_id = ?", Integer.class,
+                id)).isEqualTo(1);
+    }
+
+    @Test
+    void handlerFailureIsPersistedAndNextCycleStillProcessesAnotherJob(CapturedOutput output) {
+        Job first = saveQueued(0);
+        Job second = saveQueued(1);
+        probe.failNext = true;
+        double failedBefore = count("taskforge.worker.completions", "outcome", "FAILED");
+
+        assertThat(worker.processOne()).isTrue();
+        assertThat(count("taskforge.worker.completions", "outcome", "FAILED"))
+                .isEqualTo(failedBefore + 1);
+        Job failed = store.findById(first.id()).orElseThrow();
+        assertThat(failed.status()).isEqualTo(JobStatus.FAILED);
+        assertThat(failed.attemptCount()).isEqualTo(1);
+        assertThat(failed.failureReason()).contains("Job execution failed");
+        assertThat(failed.failureReason().orElseThrow()).doesNotContain("secret handler detail");
+
+        assertThat(worker.processOne()).isTrue();
+        assertThat(store.findById(second.id()).orElseThrow().status()).isEqualTo(JobStatus.SUCCEEDED);
+        assertThat(probe.calls).isEqualTo(2);
+        assertThat(eventLines(output)).anySatisfy(line -> assertThat(line)
+                .contains("event=handler_failed attempt=1 failure_kind=PERMANENT exception_type=IllegalStateException"));
+        assertThat(eventLines(output)).anySatisfy(line -> assertThat(line)
+                .contains("event=job_completed attempt=1 outcome=FAILED"));
+        assertThat(eventLines(output)).allSatisfy(line -> assertThat(line)
+                .doesNotContain("secret handler detail", "Quarterly report", "Simulated report preview"));
+    }
+
+    @Test
+    void missingHandlerFailsJobWithoutExecutingArbitraryCode() {
+        Job queued = saveQueued(0);
+        JobWorker withoutHandlers = new JobWorker(store, new JobHandlerRegistry(List.of()), heartbeat, metrics);
+
+        assertThat(withoutHandlers.processOne()).isTrue();
+
+        Job failed = store.findById(queued.id()).orElseThrow();
+        assertThat(failed.status()).isEqualTo(JobStatus.FAILED);
+        assertThat(failed.failureReason()).contains("No handler is available for this job type");
+        assertThat(probe.calls).isZero();
+    }
+
+    @Test
+    void postedJobHistoryShowsRetryTimingThenSuccessfulSecondAttempt() throws Exception {
+        String body = mvc.perform(post("/api/v1/jobs").contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"jobType\":\"GENERATE_REPORT\",\"payload\":{\"reportName\":\"Report\"}}"))
+                .andExpect(status().isCreated())
+                .andReturn().getResponse().getContentAsString();
+        UUID id = UUID.fromString(json.readTree(body).get("id").asText());
+        probe.retryNext = true;
+        double retryBefore = count("taskforge.worker.completions", "outcome", "RETRY_WAIT");
+
+        assertThat(worker.processOne()).isTrue();
+        assertThat(count("taskforge.worker.completions", "outcome", "RETRY_WAIT"))
+                .isEqualTo(retryBefore + 1);
+        Job waiting = store.findById(id).orElseThrow();
+        assertThat(waiting.status()).isEqualTo(JobStatus.RETRY_WAIT);
+        assertThat(waiting.attemptCount()).isEqualTo(1);
+        assertThat(waiting.failureReason()).isEmpty();
+        assertThat(worker.processOne()).isFalse();
+
+        mvc.perform(get("/api/v1/jobs/{id}/attempts", id))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$[0].outcome").value("RETRY_WAIT"))
+                .andExpect(jsonPath("$[0].failureReason").value("Temporary job execution failure"))
+                .andExpect(jsonPath("$[0].nextEligibleAt")
+                        .value(waiting.nextEligibleAt().orElseThrow().toString()));
+
+        jdbc.update("update jobs set next_eligible_at = clock_timestamp() - interval '1 hour' where id = ?",
+                id);
+        jdbc.update("update job_attempts set next_eligible_at = (select next_eligible_at from jobs where id = ?) "
+                + "where job_id = ? and attempt_number = 1", id, id);
+        assertThat(worker.processOne()).isTrue();
+        Job succeeded = store.findById(id).orElseThrow();
+        assertThat(succeeded.status()).isEqualTo(JobStatus.SUCCEEDED);
+        assertThat(succeeded.attemptCount()).isEqualTo(2);
+        assertThat(probe.calls).isEqualTo(2);
+
+        mvc.perform(get("/api/v1/jobs/{id}/attempts", id))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$[0].attemptNumber").value(1))
+                .andExpect(jsonPath("$[0].outcome").value("RETRY_WAIT"))
+                .andExpect(jsonPath("$[1].attemptNumber").value(2))
+                .andExpect(jsonPath("$[1].outcome").value("SUCCEEDED"));
+    }
+
+    private Job saveQueued(int secondOffset) {
+        Instant createdAt = Instant.parse("2020-01-01T00:00:00Z").plusSeconds(secondOffset);
+        return store.createQueued(Job.create(UUID.randomUUID(), new ReportPayload("Quarterly report"), createdAt));
+    }
+
+    private double count(String name, String... tags) {
+        return meterRegistry.get(name).tags(tags).counter().count();
+    }
+
+    private static List<String> eventLines(CapturedOutput output) {
+        return output.getAll().lines().filter(line -> line.contains("event="))
+                .map(line -> line.substring(line.indexOf("event="))).toList();
+    }
+
+    @TestConfiguration
+    static class WorkerTestConfiguration {
+        @Bean
+        @Primary
+        JobHandlerRegistry testHandlerRegistry(JdbcTemplate jdbc) {
+            return new JobHandlerRegistry(List.of(new ProbeHandler(jdbc)));
+        }
+    }
+
+    static class ProbeHandler implements JobHandler {
+        private final JdbcTemplate jdbc;
+        String statusSeenDuringHandler;
+        Integer attemptsSeenDuringHandler;
+        boolean transactionActiveDuringHandler;
+        boolean failNext;
+        boolean retryNext;
+        int calls;
+
+        ProbeHandler(JdbcTemplate jdbc) {
+            this.jdbc = jdbc;
+        }
+
+        void reset() {
+            statusSeenDuringHandler = null;
+            attemptsSeenDuringHandler = null;
+            transactionActiveDuringHandler = false;
+            failNext = false;
+            retryNext = false;
+            calls = 0;
+        }
+
+        @Override
+        public JobType jobType() {
+            return JobType.GENERATE_REPORT;
+        }
+
+        @Override
+        public String execute(JobPayload payload) {
+            calls++;
+            transactionActiveDuringHandler = TransactionSynchronizationManager.isActualTransactionActive();
+            // This separate JDBC read sees RUNNING only after the claim transaction commits.
+            UUID id = jdbc.queryForObject("select id from jobs where status = 'RUNNING'", UUID.class);
+            statusSeenDuringHandler = jdbc.queryForObject("select status from jobs where id = ?", String.class, id);
+            attemptsSeenDuringHandler = jdbc.queryForObject("select attempt_count from jobs where id = ?", Integer.class, id);
+            if (failNext) {
+                failNext = false;
+                throw new IllegalStateException("secret handler detail");
+            }
+            if (retryNext) {
+                retryNext = false;
+                throw new RetryableJobException("secret temporary detail");
+            }
+            return "Simulated report preview";
+        }
+    }
+}

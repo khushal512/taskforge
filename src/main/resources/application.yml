@@ -1,2 +1,40 @@
 server:
+  address: ${SERVER_ADDRESS:127.0.0.1}
   port: ${SERVER_PORT:8080}
+
+spring:
+  jackson:
+    deserialization:
+      fail-on-unknown-properties: true
+  datasource:
+    url: ${DATABASE_URL:jdbc:postgresql://localhost:5432/taskforge}
+    username: ${DATABASE_USERNAME:taskforge}
+    password: ${DATABASE_PASSWORD:}
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health
+  endpoint:
+    health:
+      show-details: never
+      probes:
+        enabled: true
+      group:
+        readiness:
+          include: readinessState,db
+
+taskforge:
+  worker:
+    scheduling-enabled: ${WORKER_SCHEDULING_ENABLED:true}
+    poll-delay-ms: ${WORKER_POLL_DELAY_MS:1000}
+    max-attempts: ${WORKER_MAX_ATTEMPTS:3}
+    retry-base-delay-ms: ${WORKER_RETRY_BASE_DELAY_MS:5000}
+    retry-delay-cap-ms: ${WORKER_RETRY_DELAY_CAP_MS:300000}
+    lease-duration-ms: ${WORKER_LEASE_DURATION_MS:30000}
+    heartbeat-interval-ms: ${WORKER_HEARTBEAT_INTERVAL_MS:10000}
