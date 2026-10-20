@@ -27,3 +27,5 @@ jobs:
         run: docker version --format '{{.Server.Version}}'
       - name: Verify with PostgreSQL Testcontainers
         run: mvn --batch-mode --no-transfer-progress verify
+      - name: Build application image
+        run: docker build --tag taskforge:ci .

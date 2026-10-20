@@ -15,5 +15,26 @@ services:
       timeout: 3s
       retries: 10
 
+  app:
+    profiles: [app]
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      SERVER_ADDRESS: 0.0.0.0
+      SERVER_PORT: 8080
+      DATABASE_URL: jdbc:postgresql://postgres:5432/${DATABASE_NAME:-taskforge}
+      DATABASE_USERNAME: ${DATABASE_USERNAME:-taskforge}
+      DATABASE_PASSWORD: ${DATABASE_PASSWORD:?Set DATABASE_PASSWORD in your shell or ignored .env file}
+    ports:
+      - "127.0.0.1:${SERVER_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "--output", "/dev/null", "http://127.0.0.1:8080/actuator/health/readiness"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 20s
+
 volumes:
   taskforge-postgres:

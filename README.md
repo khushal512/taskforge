@@ -32,6 +32,20 @@ The response is `{"status":"UP"}`. This route only confirms that the HTTP applic
 
 Spring Boot Actuator also provides `/actuator/health/liveness` and `/actuator/health/readiness`. Liveness reports whether the application process is running; it does not depend on PostgreSQL. Readiness includes PostgreSQL health and returns HTTP `503` with status `DOWN` when the database is unavailable. Only Actuator's `health` endpoint is exposed over HTTP; health details and `/actuator/metrics` are not exposed. These unauthenticated checks are for local development, not a public deployment.
 
+To run **both** PostgreSQL and the app in containers instead, set `DATABASE_PASSWORD` in your PowerShell session and use the optional `app` Compose profile:
+
+```powershell
+$env:DATABASE_PASSWORD = 'choose-a-local-password'
+docker compose --profile app up --build -d --wait
+Invoke-RestMethod http://127.0.0.1:8080/actuator/health/readiness
+```
+
+The image builds the runnable JAR from source with Java 21 and runs it with a Java 21 runtime as a non-root user. Its packaging step skips tests because `mvn verify` runs the full Docker-backed Testcontainers suite separately, both locally and before the image build in CI. Compose waits for PostgreSQL health before starting the app; the app readiness check above confirms that startup and Flyway migrations have completed. The plain `docker compose up -d --wait` command still starts PostgreSQL alone for Maven development.
+
+Both published ports bind to `127.0.0.1`. The container listens on all interfaces **inside its private Docker network** so Compose can forward the host's loopback port. A Maven-started app also defaults to `127.0.0.1` through `SERVER_ADDRESS`; its port defaults to 8080. These unauthenticated APIs and health routes are for trusted local development only. Do not publish or proxy them to an untrusted network without authentication and job ownership checks.
+
+An existing PostgreSQL volume retains the password chosen when it was first initialized. Supply that same password on later starts; changing `DATABASE_PASSWORD` alone does not reset the database. To test with a separate fresh volume without touching existing data, set a distinct `$env:COMPOSE_PROJECT_NAME` before `up` (and use it again for `down`). Stop only a stack you started with `docker compose --profile app down`; this leaves its named volume intact. Never use `down -v` unless you explicitly intend to delete that stack's data.
+
 ## Job API
 
 Submit a report job from PowerShell while the app is running:
@@ -125,7 +139,7 @@ The domain model and legal transitions are documented in [ADR 0001](docs/adr/000
 10. CI verification baseline (Phase 10)
 11. Durable report previews and result retrieval API (Phase 11)
 12. Logs, health, and metrics (Phase 12)
-13. Docker packaging and deployment workflow (Phase 13)
+13. Local Docker packaging and reproducible setup (Phase 13)
 14. Architecture and portfolio documentation (Phase 14)
 
 Each phase is reviewed and tested before the next begins. See the Git history for the implementation steps.
